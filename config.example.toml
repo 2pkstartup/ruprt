@@ -1,0 +1,1 @@
+mysql_url = "mysql://USER:PASSWORD@HOST:3306/"
