@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, NaiveDateTime};
 use ruprt::{
     config::AppConfig,
     db::{calculate_project_lot, find_max_serial_number, generate_serial_code, latest_message},
@@ -17,6 +17,7 @@ struct Arguments {
     project_id: u32,
     line: Option<u32>,
     date: Option<NaiveDate>,
+    raw_export: bool,
     x_offset: i64,
     y_offset: i64,
     test_mode: bool,
@@ -59,7 +60,7 @@ fn usable_serial_start(is_serial: bool, serial_number: u64) -> Option<u64> {
 
 fn parse_args(args: &[String]) -> Result<Arguments, String> {
     if args.is_empty() {
-        return Err("Usage: ruprt <project_ID> [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
+        return Err("Usage: ruprt <project_ID> [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
     }
 
     let project_id = args[0]
@@ -80,8 +81,15 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
     let mut layout_horizontal = None;
     let mut layout_vertical = None;
     let mut test_mode = false;
+    let mut raw_export = false;
     let mut index = 1;
     while index < args.len() {
+        if args[index] == "--raw" && !raw_export {
+            raw_export = true;
+            index += 1;
+            continue;
+        }
+
         if args[index] == "-t" && !test_mode {
             test_mode = true;
             if args.get(index + 1).is_some_and(|value| value == "test") {
@@ -147,7 +155,7 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
                 )?);
             }
             _ => {
-                return Err("Usage: ruprt <project_ID> [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
+                return Err("Usage: ruprt <project_ID> [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
             }
         }
         index += 2;
@@ -157,6 +165,7 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
         project_id,
         line,
         date,
+        raw_export,
         x_offset: x_offset.unwrap_or(0),
         y_offset: y_offset.unwrap_or(0),
         test_mode,
@@ -209,6 +218,14 @@ fn parse_yymmdd(value: &str) -> Result<NaiveDate, String> {
     let month = value[2..4].parse::<u32>().map_err(|_| "invalid date")?;
     let day = value[4..6].parse::<u32>().map_err(|_| "invalid date")?;
     NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| "invalid date".to_owned())
+}
+
+fn decode_raw_message(encoded: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    STANDARD.decode(encoded.trim())
+}
+
+fn raw_export_filename(project_id: u32, timestamp: NaiveDateTime) -> String {
+    format!("{project_id}_{}.clf", timestamp.format("%y-%m-%d_%H:%M:%S"))
 }
 
 fn message_has_prefix(
@@ -538,7 +555,7 @@ fn main() {
             "ruprt",
             env!("CARGO_PKG_VERSION"),
             "Loads and prepares a stored Godex EZPL print message.",
-            "ruprt <project_ID> [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
+            "ruprt <project_ID> [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
             "config.toml: mysql_url = \"mysql://USER:PASSWORD@HOST:3306/\"",
         );
         return;
@@ -567,6 +584,51 @@ fn main() {
         }
     };
 
+    // Keep `line` unchanged for later EZPL edits; only template lookup is shared.
+    let message_line = message_template_line(line);
+    let message = match latest_message(&config.mysql_url, parsed.project_id, message_line) {
+        Ok(Some(message)) => message,
+        Ok(None) => {
+            eprintln!("No message found for project and line");
+            process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("Database lookup failed: {error}");
+            process::exit(1);
+        }
+    };
+
+    if parsed.raw_export {
+        let decoded = match decode_raw_message(&message) {
+            Ok(message) => message,
+            Err(error) => {
+                eprintln!("Unable to decode stored message: {error}");
+                process::exit(1);
+            }
+        };
+        let filename = raw_export_filename(parsed.project_id, Local::now().naive_local());
+        let path = match std::env::current_dir() {
+            Ok(directory) => directory.join(filename),
+            Err(error) => {
+                eprintln!("Unable to determine output directory: {error}");
+                process::exit(1);
+            }
+        };
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("Unable to create {}: {error}", path.display());
+                process::exit(1);
+            }
+        };
+        if let Err(error) = file.write_all(&decoded) {
+            eprintln!("Unable to write {}: {error}", path.display());
+            process::exit(1);
+        }
+        println!("{}", path.display());
+        return;
+    }
+
     let date = parsed.date.unwrap_or_else(|| Local::now().date_naive());
     let serial_lookup = match find_max_serial_number(&config.mysql_url, parsed.project_id, date) {
         Ok(result) => result,
@@ -585,20 +647,6 @@ fn main() {
         }
         Err(error) => {
             eprintln!("Lot calculation failed: {error}");
-            process::exit(1);
-        }
-    };
-
-    // Keep `line` unchanged for later EZPL edits; only template lookup is shared.
-    let message_line = message_template_line(line);
-    let message = match latest_message(&config.mysql_url, parsed.project_id, message_line) {
-        Ok(Some(message)) => message,
-        Ok(None) => {
-            eprintln!("No message found for project and line");
-            process::exit(1);
-        }
-        Err(error) => {
-            eprintln!("Database lookup failed: {error}");
             process::exit(1);
         }
     };
@@ -659,8 +707,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arguments, PrintOverrides, ezpl_from_base64, ezpl_from_base64_with_serial,
-        message_has_prefix, message_template_line, parse_args, parse_yymmdd, usable_serial_start,
+        Arguments, PrintOverrides, decode_raw_message, ezpl_from_base64,
+        ezpl_from_base64_with_serial, message_has_prefix, message_template_line, parse_args,
+        parse_yymmdd, raw_export_filename, usable_serial_start,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use chrono::NaiveDate;
@@ -684,6 +733,34 @@ mod tests {
         assert!(parse(&["628", "-t"]).unwrap().test_mode);
         assert!(parse(&["628", "-t", "test"]).unwrap().test_mode);
         assert!(!parse(&["628"]).unwrap().test_mode);
+    }
+
+    #[test]
+    fn accepts_raw_export_flag() {
+        assert!(parse(&["628", "--raw"]).unwrap().raw_export);
+        assert!(parse(&["628", "-l", "1", "--raw"]).unwrap().raw_export);
+        assert!(!parse(&["628"]).unwrap().raw_export);
+    }
+
+    #[test]
+    fn decodes_raw_message_without_ezpl_processing() {
+        let encoded = STANDARD.encode(b"201||^C0\n225||raw\n");
+        assert_eq!(
+            decode_raw_message(&encoded).unwrap(),
+            b"201||^C0\n225||raw\n"
+        );
+    }
+
+    #[test]
+    fn raw_export_filename_uses_project_and_local_timestamp_format() {
+        let timestamp = NaiveDate::from_ymd_opt(2026, 10, 6)
+            .unwrap()
+            .and_hms_opt(9, 8, 7)
+            .unwrap();
+        assert_eq!(
+            raw_export_filename(945, timestamp),
+            "945_26-10-06_09:08:07.clf"
+        );
     }
 
     #[test]
