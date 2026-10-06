@@ -1,6 +1,10 @@
 use chrono::{Datelike, Days, NaiveDate};
-use mysql::{Pool, params, prelude::Queryable};
+use mysql::{Pool, Row, params, prelude::Queryable};
 use std::{collections::BTreeSet, error::Error};
+
+const LOT_DATE_CODES: [char; 17] = [
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J', 'K', 'L', 'M', 'N', 'Q', 'R', 'X', 'Z',
+];
 
 #[derive(Debug, PartialEq, Eq)]
 /// The identifying columns returned by `specs.tbl_serials`.
@@ -53,6 +57,59 @@ pub fn latest_message(
             "line" => line,
         },
     )
+}
+
+/// Calculates the project's lot by selecting the LOT() result matching DateCode.
+/// The procedure's result columns follow `LOT_DATE_CODES` order.
+pub fn calculate_project_lot(
+    mysql_url: &str,
+    project_id: u32,
+    date: NaiveDate,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let pool = Pool::new(mysql_url)?;
+    let mut connection = pool.get_conn()?;
+    let date_code: Option<String> = connection.exec_first(
+        "SELECT DateCode FROM specs.tbl_valves WHERE projectID = :project_id LIMIT 1",
+        params! { "project_id" => project_id },
+    )?;
+    let Some(date_code) = date_code else {
+        return Ok(None);
+    };
+    let Some(code) = date_code.trim().chars().next() else {
+        return Ok(None);
+    };
+    let Some(result_column) = LOT_DATE_CODES
+        .iter()
+        .position(|candidate| *candidate == code)
+    else {
+        return Err(format!("Unsupported DateCode prefix: {code}").into());
+    };
+
+    let date_argument = date.format("%Y-%m-%d").to_string();
+    let result: Option<Row> =
+        connection.exec_first("CALL specs.LOT(:date)", params! { "date" => date_argument })?;
+
+    Ok(result.and_then(|row| row.get::<String, usize>(result_column)))
+}
+
+#[cfg(test)]
+mod lot_tests {
+    use super::LOT_DATE_CODES;
+
+    #[test]
+    fn date_code_d_selects_the_fourth_lot_result() {
+        assert_eq!(LOT_DATE_CODES.iter().position(|code| *code == 'D'), Some(3));
+    }
+
+    #[test]
+    fn maps_all_supported_date_code_prefixes_in_procedure_order() {
+        assert_eq!(
+            LOT_DATE_CODES,
+            [
+                'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J', 'K', 'L', 'M', 'N', 'Q', 'R', 'X', 'Z'
+            ]
+        );
+    }
 }
 
 /// Converts a project and lot code to its print date using the shared SQL function.

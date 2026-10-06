@@ -61,6 +61,18 @@ Například `rusn 628 XE15`. `project_ID` musí být celé číslo od `0` do `50
 
 Chyby konfigurace nebo databázového připojení se vypisují na standardní chybový výstup a aplikace skončí s nenulovým návratovým kódem.
 
+## `ruprt`
+
+Načte poslední EZPL zprávu pro projekt a linku z `mess.tbl_mess`, dekóduje `mess_64` z Base64 a vypíše příkazy `2XX||` bez jejich databázových prefixů.
+
+```bash
+cargo run --bin ruprt -- 628 -l 4 -d 261001
+```
+
+Syntaxe je `ruprt <project_ID> [-l line] [-d YYMMDD]`. Linka může být zadána přes `-l`; jinak se použije `default_line` z `config.toml`. Datum `-d` je nepovinné a bez něj se použije dnešní datum. Z `specs.tbl_valves` se načte projektový `DateCode` a procedura `specs.LOT` vypočítá odpovídající lot.
+
+Aktuálně se vypočtený lot připraví, ale ještě se nedosazuje do EZPL. Plánované tiskové přepínače `-p`, `-h`, `-s`, `-c`, `-x`, `-y`, `-r` a `-q` zatím nejsou implementované.
+
 ## Vývoj
 
 Spuštění testů a kontrola formátování:
