@@ -59,6 +59,26 @@ pub fn latest_message(
     )
 }
 
+/// Generates the printer's QR/DataMatrix payload for one project and line.
+pub fn generate_serial_code(
+    mysql_url: &str,
+    project_id: u32,
+    line: u32,
+) -> Result<String, Box<dyn Error>> {
+    let pool = Pool::new(mysql_url)?;
+    let mut connection = pool.get_conn()?;
+    connection.exec_drop(
+        "CALL specs.SERNUM(@sn, :project_id, NOW(), :line)",
+        params! {
+            "project_id" => project_id,
+            "line" => line,
+        },
+    )?;
+
+    let serial_code: Option<String> = connection.query_first("SELECT @sn")?;
+    serial_code.ok_or_else(|| "specs.SERNUM returned no serial code".into())
+}
+
 /// Calculates the project's lot by selecting the LOT() result matching DateCode.
 /// The procedure's result columns follow `LOT_DATE_CODES` order.
 pub fn calculate_project_lot(

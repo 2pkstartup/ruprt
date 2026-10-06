@@ -2,10 +2,15 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Local, NaiveDate};
 use ruprt::{
     config::AppConfig,
-    db::{calculate_project_lot, latest_message},
+    db::{calculate_project_lot, generate_serial_code, latest_message},
     print_minimal_help,
 };
-use std::process;
+use std::{
+    fs::OpenOptions,
+    io::{self, Write},
+    path::Path,
+    process,
+};
 
 struct Arguments {
     project_id: u32,
@@ -13,6 +18,17 @@ struct Arguments {
     date: Option<NaiveDate>,
     x_offset: i64,
     y_offset: i64,
+    print_overrides: PrintOverrides,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PrintOverrides {
+    copies: Option<u32>,
+    temperature: Option<u32>,
+    speed: Option<u32>,
+    stop_possition: Option<i32>,
+    layout_horizontal: Option<u32>,
+    layout_vertical: Option<i32>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -37,7 +53,7 @@ fn message_template_line(requested_line: u32) -> u32 {
 
 fn parse_args(args: &[String]) -> Result<Arguments, String> {
     if args.is_empty() {
-        return Err("Usage: ruprt <project_ID> [-l line] [-d YYMMDD]".to_owned());
+        return Err("Usage: ruprt <project_ID> [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
     }
 
     let project_id = args[0]
@@ -51,6 +67,12 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
     let mut date = None;
     let mut x_offset = None;
     let mut y_offset = None;
+    let mut copies = None;
+    let mut temperature = None;
+    let mut speed = None;
+    let mut stop_possition = None;
+    let mut layout_horizontal = None;
+    let mut layout_vertical = None;
     let mut index = 1;
     while index < args.len() {
         let value = args
@@ -79,11 +101,36 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
                         .map_err(|_| "y offset must be a signed integer".to_owned())?,
                 );
             }
+            "-p" if copies.is_none() => {
+                copies = Some(parse_bounded_value(value, "print count", 1, 20_000)?);
+            }
+            "-h" if temperature.is_none() => {
+                temperature = Some(parse_bounded_value(value, "temperature", 0, 20)?);
+            }
+            "-s" if speed.is_none() => {
+                speed = Some(parse_bounded_value(value, "print speed", 2, 6)?);
+            }
+            "-e" if stop_possition.is_none() => {
+                stop_possition = Some(parse_bounded_signed_value(
+                    value,
+                    "stop_possition",
+                    -40,
+                    40,
+                )?);
+            }
+            "-r" if layout_horizontal.is_none() => {
+                layout_horizontal = Some(parse_bounded_value(value, "horizontal layout", 0, 100)?);
+            }
+            "-q" if layout_vertical.is_none() => {
+                layout_vertical = Some(parse_bounded_signed_value(
+                    value,
+                    "vertical layout",
+                    -100,
+                    100,
+                )?);
+            }
             _ => {
-                return Err(
-                    "Usage: ruprt <project_ID> [-l line] [-d YYMMDD] [-x offset] [-y offset]"
-                        .to_owned(),
-                );
+                return Err("Usage: ruprt <project_ID> [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
             }
         }
         index += 2;
@@ -95,7 +142,44 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
         date,
         x_offset: x_offset.unwrap_or(0),
         y_offset: y_offset.unwrap_or(0),
+        print_overrides: PrintOverrides {
+            copies,
+            temperature,
+            speed,
+            stop_possition,
+            layout_horizontal,
+            layout_vertical,
+        },
     })
+}
+
+fn parse_bounded_value(value: &str, name: &str, minimum: u32, maximum: u32) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("{name} must be an integer from {minimum} to {maximum}"))?;
+    if !(minimum..=maximum).contains(&parsed) {
+        return Err(format!(
+            "{name} must be an integer from {minimum} to {maximum}"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_bounded_signed_value(
+    value: &str,
+    name: &str,
+    minimum: i32,
+    maximum: i32,
+) -> Result<i32, String> {
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|_| format!("{name} must be an integer from {minimum} to {maximum}"))?;
+    if !(minimum..=maximum).contains(&parsed) {
+        return Err(format!(
+            "{name} must be an integer from {minimum} to {maximum}"
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_yymmdd(value: &str) -> Result<NaiveDate, String> {
@@ -107,6 +191,18 @@ fn parse_yymmdd(value: &str) -> Result<NaiveDate, String> {
     let month = value[2..4].parse::<u32>().map_err(|_| "invalid date")?;
     let day = value[4..6].parse::<u32>().map_err(|_| "invalid date")?;
     NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| "invalid date".to_owned())
+}
+
+fn message_has_prefix(
+    encoded: &str,
+    target_prefix: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let decoded = STANDARD.decode(encoded.trim())?;
+    let decoded = String::from_utf8(decoded)?;
+    Ok(decoded.lines().any(|row| {
+        row.split_once("||")
+            .is_some_and(|(prefix, _)| prefix == target_prefix)
+    }))
 }
 
 fn coordinates_for_row(prefix: &str, command: &str) -> Option<(i32, i32)> {
@@ -183,16 +279,71 @@ fn shift_row_coordinates(
     }
 }
 
+fn replace_number_after_marker(
+    command: &str,
+    marker: &str,
+    value: &str,
+) -> Result<Option<String>, String> {
+    let Some(marker_start) = command.find(marker) else {
+        return Ok(None);
+    };
+    let value_start = marker_start + marker.len();
+    let digits_start = if command[value_start..].starts_with(['-', '+']) {
+        value_start + 1
+    } else {
+        value_start
+    };
+    let value_end = command[digits_start..]
+        .find(|character: char| !character.is_ascii_digit())
+        .map_or(command.len(), |offset| digits_start + offset);
+    if digits_start == value_end {
+        return Err(format!("EZPL command {marker} has no numeric value"));
+    }
+
+    Ok(Some(format!(
+        "{}{}{}",
+        &command[..value_start],
+        value,
+        &command[value_end..]
+    )))
+}
+
+#[cfg(test)]
 fn ezpl_from_base64(
     encoded: &str,
     calculated_lot: &str,
     x_offset: i64,
     y_offset: i64,
+    print_overrides: &PrintOverrides,
+) -> Result<ProcessedMessage, Box<dyn std::error::Error>> {
+    ezpl_from_base64_with_serial(
+        encoded,
+        calculated_lot,
+        x_offset,
+        y_offset,
+        print_overrides,
+        None,
+    )
+}
+
+fn ezpl_from_base64_with_serial(
+    encoded: &str,
+    calculated_lot: &str,
+    x_offset: i64,
+    y_offset: i64,
+    print_overrides: &PrintOverrides,
+    serial_code: Option<&str>,
 ) -> Result<ProcessedMessage, Box<dyn std::error::Error>> {
     let decoded = STANDARD.decode(encoded.trim())?;
     let decoded = String::from_utf8(decoded)?;
     let mut commands = Vec::new();
     let mut minima = CoordinateMinima::default();
+    let mut copies_applied = false;
+    let mut temperature_applied = false;
+    let mut speed_applied = false;
+    let mut energy_applied = false;
+    let mut layout_horizontal_applied = false;
+    let mut layout_vertical_applied = false;
     for row in decoded.lines() {
         let Some((prefix, command)) = row.split_once("||") else {
             continue;
@@ -207,7 +358,15 @@ fn ezpl_from_base64(
             continue;
         }
 
-        if prefix == "210" {
+        if prefix == "225" {
+            let serial_code = serial_code.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "EZPL 225 row requires a generated serial code",
+                )
+            })?;
+            commands.push(serial_code.to_owned());
+        } else if prefix == "210" {
             let Some((command, _old_lot)) = command.rsplit_once(',') else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -217,8 +376,70 @@ fn ezpl_from_base64(
             };
             commands.push(format!("{command},{calculated_lot}"));
         } else {
-            commands.push(shift_row_coordinates(prefix, command, x_offset, y_offset)?);
+            let mut command = shift_row_coordinates(prefix, command, x_offset, y_offset)?;
+            if prefix == "204" {
+                if let Some(value) = print_overrides.copies {
+                    if let Some(updated) =
+                        replace_number_after_marker(&command, "^P", &value.to_string())?
+                    {
+                        command = updated;
+                        copies_applied = true;
+                    }
+                }
+            } else if prefix == "201" {
+                if let Some(value) = print_overrides.temperature {
+                    if let Some(updated) =
+                        replace_number_after_marker(&command, "^H", &value.to_string())?
+                    {
+                        command = updated;
+                        temperature_applied = true;
+                    }
+                }
+                if let Some(value) = print_overrides.speed {
+                    if let Some(updated) =
+                        replace_number_after_marker(&command, "^S", &value.to_string())?
+                    {
+                        command = updated;
+                        speed_applied = true;
+                    }
+                }
+                if let Some(value) = print_overrides.stop_possition {
+                    if let Some(updated) =
+                        replace_number_after_marker(&command, "^E", &value.to_string())?
+                    {
+                        command = updated;
+                        energy_applied = true;
+                    }
+                }
+                if let Some(value) = print_overrides.layout_horizontal {
+                    if let Some(updated) =
+                        replace_number_after_marker(&command, "^R", &value.to_string())?
+                    {
+                        command = updated;
+                        layout_horizontal_applied = true;
+                    }
+                }
+                if let Some(value) = print_overrides.layout_vertical {
+                    if let Some(updated) =
+                        replace_number_after_marker(&command, "~Q", &value.to_string())?
+                    {
+                        command = updated;
+                        layout_vertical_applied = true;
+                    }
+                }
+            }
+            commands.push(command);
         }
+    }
+
+    if (print_overrides.copies.is_some() && !copies_applied)
+        || (print_overrides.temperature.is_some() && !temperature_applied)
+        || (print_overrides.speed.is_some() && !speed_applied)
+        || (print_overrides.stop_possition.is_some() && !energy_applied)
+        || (print_overrides.layout_horizontal.is_some() && !layout_horizontal_applied)
+        || (print_overrides.layout_vertical.is_some() && !layout_vertical_applied)
+    {
+        return Err("requested print setting was not found in the EZPL message".into());
     }
 
     let mut commands = commands.join("\n");
@@ -231,6 +452,30 @@ fn ezpl_from_base64(
     })
 }
 
+fn append_success_log(
+    config_path: &Path,
+    date: NaiveDate,
+    line: u32,
+    args: &[String],
+) -> io::Result<()> {
+    let log_path = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("ruprt.log");
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+
+    writeln!(
+        log,
+        "{} date={} line={} args={args:?}",
+        Local::now().format("%Y-%m-%d %H:%M:%S%:z"),
+        date,
+        line,
+    )
+}
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
@@ -238,7 +483,7 @@ fn main() {
             "ruprt",
             env!("CARGO_PKG_VERSION"),
             "Loads and prepares a stored Godex EZPL print message.",
-            "ruprt <project_ID> [-l line] [-d YYMMDD] [-x offset] [-y offset]",
+            "ruprt <project_ID> [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
             "config.toml: mysql_url = \"mysql://USER:PASSWORD@HOST:3306/\"",
         );
         return;
@@ -252,8 +497,8 @@ fn main() {
         }
     };
 
-    let config = match AppConfig::load() {
-        Ok(config) => config,
+    let (config, config_path) = match AppConfig::load_with_path() {
+        Ok(loaded) => loaded,
         Err(error) => {
             eprintln!("Failed to load config.toml: {error}");
             process::exit(1);
@@ -294,8 +539,34 @@ fn main() {
         }
     };
 
-    match ezpl_from_base64(&message, &calculated_lot, parsed.x_offset, parsed.y_offset) {
+    let serial_code = match message_has_prefix(&message, "225") {
+        Ok(false) => None,
+        Ok(true) => match generate_serial_code(&config.mysql_url, parsed.project_id, line) {
+            Ok(serial_code) => Some(serial_code),
+            Err(error) => {
+                eprintln!("Serial code generation failed: {error}");
+                process::exit(1);
+            }
+        },
+        Err(error) => {
+            eprintln!("Unable to inspect stored message: {error}");
+            process::exit(1);
+        }
+    };
+
+    match ezpl_from_base64_with_serial(
+        &message,
+        &calculated_lot,
+        parsed.x_offset,
+        parsed.y_offset,
+        &parsed.print_overrides,
+        serial_code.as_deref(),
+    ) {
         Ok(processed) => {
+            if let Err(error) = append_success_log(&config_path, date, line, &args) {
+                eprintln!("Failed to write ruprt.log: {error}");
+                process::exit(1);
+            }
             let _coordinate_minima = (processed.minima.x, processed.minima.y);
             print!("{}", processed.ezpl);
         }
@@ -308,7 +579,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arguments, ezpl_from_base64, message_template_line, parse_args, parse_yymmdd};
+    use super::{
+        Arguments, PrintOverrides, ezpl_from_base64, ezpl_from_base64_with_serial,
+        message_has_prefix, message_template_line, parse_args, parse_yymmdd,
+    };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use chrono::NaiveDate;
 
@@ -336,6 +610,44 @@ mod tests {
     }
 
     #[test]
+    fn accepts_print_override_ranges() {
+        let parsed = parse(&["628", "-p", "1", "-h", "0", "-s", "2"]).unwrap();
+        assert_eq!(parsed.print_overrides.copies, Some(1));
+        assert_eq!(parsed.print_overrides.temperature, Some(0));
+        assert_eq!(parsed.print_overrides.speed, Some(2));
+
+        let parsed = parse(&["628", "-p", "20000", "-h", "20", "-s", "6"]).unwrap();
+        assert_eq!(parsed.print_overrides.copies, Some(20000));
+        assert_eq!(parsed.print_overrides.temperature, Some(20));
+        assert_eq!(parsed.print_overrides.speed, Some(6));
+
+        assert!(parse(&["628", "-p", "0"]).is_err());
+        assert!(parse(&["628", "-p", "20001"]).is_err());
+        assert!(parse(&["628", "-h", "21"]).is_err());
+        assert!(parse(&["628", "-s", "1"]).is_err());
+        assert!(parse(&["628", "-s", "7"]).is_err());
+    }
+
+    #[test]
+    fn accepts_energy_and_layout_override_ranges() {
+        let minimums = parse(&["628", "-e", "-40", "-r", "0", "-q", "-100"]).unwrap();
+        assert_eq!(minimums.print_overrides.stop_possition, Some(-40));
+        assert_eq!(minimums.print_overrides.layout_horizontal, Some(0));
+        assert_eq!(minimums.print_overrides.layout_vertical, Some(-100));
+
+        let maximums = parse(&["628", "-e", "40", "-r", "100", "-q", "100"]).unwrap();
+        assert_eq!(maximums.print_overrides.stop_possition, Some(40));
+        assert_eq!(maximums.print_overrides.layout_horizontal, Some(100));
+        assert_eq!(maximums.print_overrides.layout_vertical, Some(100));
+
+        assert!(parse(&["628", "-e", "-41"]).is_err());
+        assert!(parse(&["628", "-e", "41"]).is_err());
+        assert!(parse(&["628", "-r", "101"]).is_err());
+        assert!(parse(&["628", "-q", "-101"]).is_err());
+        assert!(parse(&["628", "-q", "101"]).is_err());
+    }
+
+    #[test]
     fn maps_lines_two_through_four_to_the_shared_template_line() {
         assert_eq!(message_template_line(2), 2);
         assert_eq!(message_template_line(3), 2);
@@ -356,16 +668,52 @@ mod tests {
     fn decodes_and_keeps_only_ezpl_command_rows() {
         let message = STANDARD.encode("001||01\n201||^H15\n225||^C0\n");
         assert_eq!(
-            ezpl_from_base64(&message, "LOT42", 0, 0).unwrap().ezpl,
-            "^H15\n^C0\n"
+            ezpl_from_base64_with_serial(
+                &message,
+                "LOT42",
+                0,
+                0,
+                &PrintOverrides::default(),
+                Some("T88792^C0511619962"),
+            )
+            .unwrap()
+            .ezpl,
+            "^H15\nT88792^C0511619962\n"
         );
+    }
+
+    #[test]
+    fn calls_for_a_serial_code_only_when_message_has_225_row() {
+        let with_qr = STANDARD.encode("201||^E\n225||old-code\n");
+        let without_qr = STANDARD.encode("201||^E\n");
+        assert!(message_has_prefix(&with_qr, "225").unwrap());
+        assert!(!message_has_prefix(&without_qr, "225").unwrap());
+    }
+
+    #[test]
+    fn replaces_the_entire_225_row_with_generated_serial_code() {
+        let message = STANDARD.encode("225||CZ4475004970#10042015#^C0\n201||^E\n");
+        let result = ezpl_from_base64_with_serial(
+            &message,
+            "LOT42",
+            0,
+            0,
+            &PrintOverrides::default(),
+            Some("T88792C0F126279^C0511619962"),
+        )
+        .unwrap();
+        assert_eq!(result.ezpl, "T88792C0F126279^C0511619962\n^E\n");
+
+        assert!(ezpl_from_base64(&message, "LOT42", 0, 0, &PrintOverrides::default()).is_err());
     }
 
     #[test]
     fn replaces_the_text_after_the_last_comma_in_the_210_row() {
         let message = STANDARD.encode("210||AD,0035,0245,1,1,0,0,OLD-LOT\n201||^E\n");
         assert_eq!(
-            ezpl_from_base64(&message, "NEW-LOT", 0, 0).unwrap().ezpl,
+            ezpl_from_base64(&message, "NEW-LOT", 0, 0, &PrintOverrides::default())
+                .unwrap()
+                .ezpl,
             "AD,0035,0245,1,1,0,0,NEW-LOT\n^E\n"
         );
     }
@@ -374,7 +722,8 @@ mod tests {
     fn stores_the_smallest_coordinates_from_231_and_232_rows() {
         let message =
             STANDARD.encode("231||AD,0035,0245,1,1\n232||W0300,0045,3,2\n232||XRB0020,0030,6,2\n");
-        let processed = ezpl_from_base64(&message, "LOT42", 0, 0).unwrap();
+        let processed =
+            ezpl_from_base64(&message, "LOT42", 0, 0, &PrintOverrides::default()).unwrap();
 
         assert_eq!(processed.minima.x, Some(20));
         assert_eq!(processed.minima.y, Some(30));
@@ -384,7 +733,8 @@ mod tests {
     fn applies_signed_offsets_and_clamps_coordinates_to_zero() {
         let message =
             STANDARD.encode("231||AD,0035,0245,1,1\n232||W0300,0045,3,2\n232||XRB0020,0030,6,2\n");
-        let processed = ezpl_from_base64(&message, "LOT42", -50, 10).unwrap();
+        let processed =
+            ezpl_from_base64(&message, "LOT42", -50, 10, &PrintOverrides::default()).unwrap();
 
         assert_eq!(
             processed.ezpl,
@@ -395,7 +745,34 @@ mod tests {
     #[test]
     fn clamps_negative_coordinate_results_to_zero() {
         let message = STANDARD.encode("231||AD,0005,0003,1,1\n");
-        let processed = ezpl_from_base64(&message, "LOT42", -10, -10).unwrap();
+        let processed =
+            ezpl_from_base64(&message, "LOT42", -10, -10, &PrintOverrides::default()).unwrap();
         assert_eq!(processed.ezpl, "AD,0000,0000,1,1\n");
+    }
+
+    #[test]
+    fn replaces_copy_temperature_and_speed_commands() {
+        let message = STANDARD.encode("204||^P100\n201||^H15\n201||^S2\n");
+        let overrides = PrintOverrides {
+            copies: Some(20000),
+            temperature: Some(0),
+            speed: Some(6),
+            ..PrintOverrides::default()
+        };
+        let processed = ezpl_from_base64(&message, "LOT42", 0, 0, &overrides).unwrap();
+        assert_eq!(processed.ezpl, "^P20000\n^H0\n^S6\n");
+    }
+
+    #[test]
+    fn replaces_energy_and_layout_commands() {
+        let message = STANDARD.encode("201||^E0\n201||^R50\n201||~Q0\n");
+        let overrides = PrintOverrides {
+            stop_possition: Some(-40),
+            layout_horizontal: Some(100),
+            layout_vertical: Some(-100),
+            ..PrintOverrides::default()
+        };
+        let processed = ezpl_from_base64(&message, "LOT42", 0, 0, &overrides).unwrap();
+        assert_eq!(processed.ezpl, "^E-40\n^R100\n~Q-100\n");
     }
 }
