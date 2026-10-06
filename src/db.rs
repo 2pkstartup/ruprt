@@ -37,6 +37,24 @@ pub fn find_serial_config(
     }))
 }
 
+/// Loads the latest stored message for a project and line.
+/// Date breaks ties by most recent message; `id` makes the order deterministic.
+pub fn latest_message(
+    mysql_url: &str,
+    project_id: u32,
+    line: u32,
+) -> Result<Option<String>, mysql::Error> {
+    let pool = Pool::new(mysql_url)?;
+    let mut connection = pool.get_conn()?;
+    connection.exec_first(
+        "SELECT mess_64 FROM mess.tbl_mess WHERE projectID = :project_id AND line = :line ORDER BY date DESC, id DESC LIMIT 1",
+        params! {
+            "project_id" => project_id,
+            "line" => line,
+        },
+    )
+}
+
 /// Converts a project and lot code to its print date using the shared SQL function.
 /// A SQL `NULL` result is returned as `None` when the lot has no date mapping.
 pub fn lot_to_date(

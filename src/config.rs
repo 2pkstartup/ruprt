@@ -6,6 +6,9 @@ use std::{env, error::Error, fs, io, path::Path};
 pub struct AppConfig {
     /// MySQL URL, including credentials, host, and optional default database.
     pub mysql_url: String,
+    /// Optional production line used when the CLI does not specify `-l`.
+    #[serde(default)]
+    pub default_line: Option<u32>,
 }
 
 impl AppConfig {
