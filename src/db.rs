@@ -12,6 +12,7 @@ pub struct SerialConfig {
     pub id: u64,
     pub project_id: u32,
     pub coding: u32,
+    pub digit_count: Option<u32>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,16 +30,19 @@ pub fn find_serial_config(
 ) -> Result<Option<SerialConfig>, mysql::Error> {
     let pool = Pool::new(mysql_url)?;
     let mut connection = pool.get_conn()?;
-    let row: Option<(u64, u32, u32)> = connection.exec_first(
-        "SELECT id, projectID, coding FROM specs.tbl_serials WHERE projectID = :project_id",
+    let row: Option<(u64, u32, u32, Option<u32>)> = connection.exec_first(
+        "SELECT s.id, s.projectID, s.coding, c.digit_count FROM specs.tbl_serials s LEFT JOIN specs.tbl_coding c ON s.coding = c.id WHERE s.projectID = :project_id",
         params! { "project_id" => project_id },
     )?;
 
-    Ok(row.map(|(id, project_id, coding)| SerialConfig {
-        id,
-        project_id,
-        coding,
-    }))
+    Ok(
+        row.map(|(id, project_id, coding, digit_count)| SerialConfig {
+            id,
+            project_id,
+            coding,
+            digit_count,
+        }),
+    )
 }
 
 /// Loads the latest stored message for a project and line.
@@ -134,6 +138,15 @@ mod lot_tests {
 
 /// Converts a project and lot code to its print date using the shared SQL function.
 /// A SQL `NULL` result is returned as `None` when the lot has no date mapping.
+fn parse_nullable_lot_date(
+    result: Option<Option<String>>,
+) -> Result<Option<NaiveDate>, chrono::ParseError> {
+    match result {
+        Some(Some(value)) => NaiveDate::parse_from_str(&value, "%Y-%m-%d").map(Some),
+        Some(None) | None => Ok(None),
+    }
+}
+
 pub fn lot_to_date(
     mysql_url: &str,
     project_id: u32,
@@ -141,7 +154,7 @@ pub fn lot_to_date(
 ) -> Result<Option<NaiveDate>, Box<dyn Error>> {
     let pool = Pool::new(mysql_url)?;
     let mut connection = pool.get_conn()?;
-    let date: Option<String> = connection.exec_first(
+    let date: Option<Option<String>> = connection.exec_first(
         "SELECT DATE_FORMAT(specs.LOT_TO_DATE(:project_id, :lot), '%Y-%m-%d')",
         params! {
             "project_id" => project_id,
@@ -149,9 +162,27 @@ pub fn lot_to_date(
         },
     )?;
 
-    date.map(|value| NaiveDate::parse_from_str(&value, "%Y-%m-%d"))
-        .transpose()
-        .map_err(Into::into)
+    parse_nullable_lot_date(date).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod nullable_lot_date_tests {
+    use super::parse_nullable_lot_date;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn sql_null_means_no_matching_lot_date() {
+        assert_eq!(parse_nullable_lot_date(Some(None)).unwrap(), None);
+        assert_eq!(parse_nullable_lot_date(None).unwrap(), None);
+    }
+
+    #[test]
+    fn parses_a_non_null_lot_date() {
+        assert_eq!(
+            parse_nullable_lot_date(Some(Some("2026-10-03".to_owned()))).unwrap(),
+            Some(NaiveDate::from_ymd_opt(2026, 10, 3).unwrap())
+        );
+    }
 }
 
 /// Finds the highest serial number for a project and print date.

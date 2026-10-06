@@ -64,7 +64,7 @@ Například `rusn 628 XE15`. `project_ID` musí být celé číslo od `0` do `50
 
 - `-1` – projekt není serializovaný
 - `0` – lot nemá přiřazené datum nebo nebylo nalezeno sériové číslo
-- kladné číslo – nejvyšší nalezené sériové číslo
+- kladné SN – nejvyšší nalezené číslo, doplněné nulami zleva na délku `specs.tbl_coding.digit_count`
 
 Chyby konfigurace nebo databázového připojení se vypisují na standardní chybový výstup a aplikace skončí s nenulovým návratovým kódem.
 

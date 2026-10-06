@@ -11,6 +11,25 @@ struct Arguments {
     lot: String,
 }
 
+fn format_serial_number(serial_number: u64, digit_count: Option<u32>) -> Result<String, String> {
+    if serial_number == 0 {
+        return Ok("0".to_owned());
+    }
+
+    let digit_count = digit_count
+        .filter(|count| *count > 0)
+        .ok_or_else(|| "project has no valid serial digit_count".to_owned())?
+        as usize;
+    let serial_text = serial_number.to_string();
+    if serial_text.len() > digit_count {
+        return Err(format!(
+            "serial number {serial_number} exceeds configured width of {digit_count} digits"
+        ));
+    }
+
+    Ok(format!("{serial_number:0digit_count$}"))
+}
+
 /// Accepts exactly a project ID and its lot code.
 fn parse_args(args: &[String]) -> Result<Arguments, String> {
     if args.len() != 2 {
@@ -61,17 +80,17 @@ fn main() {
         }
     };
 
-    let is_serial = match find_serial_config(&config.mysql_url, parsed.project_id) {
-        Ok(result) => result.is_some(),
+    let serial_config = match find_serial_config(&config.mysql_url, parsed.project_id) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            println!("-1");
+            return;
+        }
         Err(error) => {
             eprintln!("Database lookup failed: {error}");
             process::exit(1);
         }
     };
-    if !is_serial {
-        println!("-1");
-        return;
-    }
 
     let date_of_print = match lot_to_date(&config.mysql_url, parsed.project_id, &parsed.lot) {
         Ok(Some(date)) => date,
@@ -94,17 +113,19 @@ fn main() {
         }
     };
 
-    // A non-serialized project uses -1; serialized projects return the procedure's maximum.
-    if lookup.is_serial {
-        println!("{}", lookup.max_serial);
-    } else {
-        println!("-1");
-    }
+    let serial_output = match format_serial_number(lookup.max_serial, serial_config.digit_count) {
+        Ok(serial) => serial,
+        Err(error) => {
+            eprintln!("Unable to format serial number: {error}");
+            process::exit(1);
+        }
+    };
+    println!("{serial_output}");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Arguments, parse_args};
+    use super::{Arguments, format_serial_number, parse_args};
 
     fn parse(values: &[&str]) -> Result<Arguments, String> {
         let args: Vec<String> = values.iter().map(|value| (*value).to_owned()).collect();
@@ -132,6 +153,15 @@ mod tests {
     #[test]
     fn accepts_four_character_lot_code() {
         assert_eq!(parse(&["628", "XE15"]).unwrap().lot, "XE15");
+    }
+
+    #[test]
+    fn pads_serial_to_configured_digit_count() {
+        assert_eq!(format_serial_number(8960, Some(6)).unwrap(), "008960");
+        assert_eq!(format_serial_number(123456, Some(6)).unwrap(), "123456");
+        assert_eq!(format_serial_number(0, None).unwrap(), "0");
+        assert!(format_serial_number(1234567, Some(6)).is_err());
+        assert!(format_serial_number(12, None).is_err());
     }
 
     #[test]
