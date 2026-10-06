@@ -20,6 +20,9 @@ pub struct AppConfig {
     /// TCP port of the raw printer service.
     #[serde(default)]
     pub printer_port: Option<u16>,
+    /// Numeric printer identifier stored in autosave records.
+    #[serde(default)]
+    pub printer_id: Option<u32>,
 }
 
 impl AppConfig {

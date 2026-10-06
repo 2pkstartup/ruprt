@@ -2,19 +2,23 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Local, NaiveDate, NaiveDateTime};
 use ruprt::{
     config::AppConfig,
-    db::{calculate_project_lot, find_max_serial_number, generate_serial_code, latest_message},
+    db::{
+        calculate_project_lot, find_max_serial_number, generate_serial_code, latest_message,
+        save_autosave_message,
+    },
     print_minimal_help,
     printer::send_to_printer,
 };
 use std::{
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process,
 };
 
 struct Arguments {
-    project_id: u32,
+    project_id: Option<u32>,
+    input_clf: Option<PathBuf>,
     line: Option<u32>,
     date: Option<NaiveDate>,
     raw_export: bool,
@@ -43,6 +47,7 @@ struct CoordinateMinima {
 #[derive(Debug, PartialEq, Eq)]
 struct ProcessedMessage {
     ezpl: String,
+    autosave_base64: String,
     minima: CoordinateMinima,
 }
 
@@ -59,15 +64,23 @@ fn usable_serial_start(is_serial: bool, serial_number: u64) -> Option<u64> {
 }
 
 fn parse_args(args: &[String]) -> Result<Arguments, String> {
-    if args.is_empty() {
-        return Err("Usage: ruprt <project_ID> [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
-    }
-
-    let project_id = args[0]
-        .parse::<u32>()
-        .map_err(|_| "project_ID must be an integer from 0 to 5000".to_owned())?;
-    if project_id > 5000 {
+    let usage = "Usage: ruprt <project_ID|message.clf> [message.clf] [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]";
+    let first = args.first().ok_or_else(|| usage.to_owned())?;
+    let project_id = first.parse::<u32>().ok();
+    if project_id.is_some_and(|id| id > 5000) {
         return Err("project_ID must be an integer from 0 to 5000".to_owned());
+    }
+    let mut input_clf = None;
+    let mut index = 1;
+    if project_id.is_none() {
+        if Path::new(first)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("clf"))
+        {
+            input_clf = Some(PathBuf::from(first));
+        } else {
+            return Err(usage.to_owned());
+        }
     }
 
     let mut line = None;
@@ -82,8 +95,17 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
     let mut layout_vertical = None;
     let mut test_mode = false;
     let mut raw_export = false;
-    let mut index = 1;
     while index < args.len() {
+        if input_clf.is_none()
+            && Path::new(&args[index])
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("clf"))
+        {
+            input_clf = Some(PathBuf::from(&args[index]));
+            index += 1;
+            continue;
+        }
+
         if args[index] == "--raw" && !raw_export {
             raw_export = true;
             index += 1;
@@ -155,14 +177,19 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
                 )?);
             }
             _ => {
-                return Err("Usage: ruprt <project_ID> [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
+                return Err(usage.to_owned());
             }
         }
         index += 2;
     }
 
+    if raw_export && input_clf.is_some() {
+        return Err("--raw cannot be combined with a .clf input file".to_owned());
+    }
+
     Ok(Arguments {
         project_id,
+        input_clf,
         line,
         date,
         raw_export,
@@ -224,8 +251,107 @@ fn decode_raw_message(encoded: &str) -> Result<Vec<u8>, base64::DecodeError> {
     STANDARD.decode(encoded.trim())
 }
 
-fn raw_export_filename(project_id: u32, timestamp: NaiveDateTime) -> String {
-    format!("{project_id}_{}.clf", timestamp.format("%y-%m-%d_%H:%M:%S"))
+fn local_name_component(local_name: &str) -> Option<String> {
+    let mut component = String::new();
+    let mut previous_was_separator = false;
+
+    for character in local_name.trim().chars() {
+        let character = if character.is_whitespace()
+            || character.is_control()
+            || matches!(
+                character,
+                '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*'
+            ) {
+            '-'
+        } else {
+            character
+        };
+
+        if character == '-' {
+            if !previous_was_separator {
+                component.push(character);
+            }
+            previous_was_separator = true;
+        } else {
+            component.push(character);
+            previous_was_separator = false;
+        }
+    }
+
+    let component = component.trim_matches(['-', '.']).to_owned();
+    (!component.is_empty()).then_some(component)
+}
+
+fn raw_message_local_name_value(decoded: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    let decoded = std::str::from_utf8(decoded)?;
+    let local_name = decoded
+        .lines()
+        .find_map(|row| {
+            let (prefix, value) = row.split_once("||")?;
+            (prefix == "009").then_some(value)
+        })
+        .ok_or("raw message is missing its 009 local_name row")?;
+
+    let local_name = local_name.trim();
+    if local_name.is_empty() {
+        return Err("raw message has an empty local_name".into());
+    }
+    Ok(local_name.to_owned())
+}
+
+fn raw_message_local_name(decoded: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    let local_name = raw_message_local_name_value(decoded)?;
+    local_name_component(&local_name).ok_or_else(|| "raw message has an empty local_name".into())
+}
+
+fn raw_message_project_id(decoded: &[u8]) -> Result<Option<u32>, Box<dyn std::error::Error>> {
+    let decoded = std::str::from_utf8(decoded)?;
+    decoded
+        .lines()
+        .find_map(|row| {
+            let (prefix, value) = row.split_once("||")?;
+            (prefix == "008").then_some(value.trim())
+        })
+        .map(|value| {
+            let project_id = value.parse::<u32>()?;
+            if project_id > 5000 {
+                return Err("project_ID in CLF must be from 0 to 5000".into());
+            }
+            Ok(project_id)
+        })
+        .transpose()
+}
+
+fn load_clf_input(
+    path: &Path,
+    argument_project_id: Option<u32>,
+) -> Result<(u32, String, Option<String>), Box<dyn std::error::Error>> {
+    let decoded = fs::read(path)?;
+    let project_id = resolve_project_id(argument_project_id, raw_message_project_id(&decoded)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let local_name = raw_message_local_name_value(&decoded)?;
+    Ok((project_id, STANDARD.encode(decoded), Some(local_name)))
+}
+
+fn resolve_project_id(
+    argument_project_id: Option<u32>,
+    message_project_id: Option<u32>,
+) -> Result<u32, String> {
+    match (argument_project_id, message_project_id) {
+        (Some(argument), Some(message)) if argument != message => Err(format!(
+            "project_ID {argument} does not match CLF project_ID {message}"
+        )),
+        (Some(argument), _) => Ok(argument),
+        (None, Some(message)) => Ok(message),
+        (None, None) => Err("project_ID is missing from arguments and CLF row 008".to_owned()),
+    }
+}
+
+fn raw_export_filename(project_id: u32, local_name: &str, timestamp: NaiveDateTime) -> String {
+    format!(
+        "{project_id}_{local_name}_{}.clf",
+        timestamp.format("%y-%m-%d_%H:%M:%S")
+    )
 }
 
 fn message_has_prefix(
@@ -365,6 +491,30 @@ fn replace_serial_start(command: &str, serial_number: u64) -> Result<String, Str
     ))
 }
 
+fn zero_number_after_marker(command: &str, marker: &str) -> Result<Option<String>, String> {
+    let Some(marker_start) = command.find(marker) else {
+        return Ok(None);
+    };
+    let value_start = marker_start + marker.len();
+    let digits_start = if command[value_start..].starts_with(['-', '+']) {
+        value_start + 1
+    } else {
+        value_start
+    };
+    let value_end = command[digits_start..]
+        .find(|character: char| !character.is_ascii_digit())
+        .map_or(command.len(), |offset| digits_start + offset);
+    let width = value_end - digits_start;
+    if width == 0 {
+        return Err(format!("EZPL command {marker} has no numeric value"));
+    }
+
+    Ok(Some(
+        replace_number_after_marker(command, marker, &"0".repeat(width))?
+            .expect("marker was checked above"),
+    ))
+}
+
 #[cfg(test)]
 fn ezpl_from_base64(
     encoded: &str,
@@ -396,6 +546,7 @@ fn ezpl_from_base64_with_serial(
     let decoded = STANDARD.decode(encoded.trim())?;
     let decoded = String::from_utf8(decoded)?;
     let mut commands = Vec::new();
+    let mut autosave_rows = Vec::new();
     let mut minima = CoordinateMinima::default();
     let mut copies_applied = false;
     let mut temperature_applied = false;
@@ -405,6 +556,7 @@ fn ezpl_from_base64_with_serial(
     let mut layout_vertical_applied = false;
     for row in decoded.lines() {
         let Some((prefix, command)) = row.split_once("||") else {
+            autosave_rows.push(row.to_owned());
             continue;
         };
         if let Some((x, y)) = coordinates_for_row(prefix, command) {
@@ -414,6 +566,7 @@ fn ezpl_from_base64_with_serial(
             || !prefix.starts_with('2')
             || !prefix.bytes().all(|byte| byte.is_ascii_digit())
         {
+            autosave_rows.push(row.to_owned());
             continue;
         }
 
@@ -425,12 +578,15 @@ fn ezpl_from_base64_with_serial(
                 )
             })?;
             commands.push(serial_code.to_owned());
+            autosave_rows.push(format!("{prefix}||{serial_code}"));
         } else if prefix == "207" {
-            if let Some(serial_start) = serial_start {
-                commands.push(replace_serial_start(command, serial_start)?);
-            } else {
-                commands.push(command.to_owned());
-            }
+            let printed_command = match serial_start {
+                Some(serial_start) => replace_serial_start(command, serial_start)?,
+                None => command.to_owned(),
+            };
+            let saved_command = replace_serial_start(command, 0)?;
+            commands.push(printed_command);
+            autosave_rows.push(format!("{prefix}||{saved_command}"));
         } else if prefix == "210" {
             let Some((command, _old_lot)) = command.rsplit_once(',') else {
                 return Err(std::io::Error::new(
@@ -439,7 +595,9 @@ fn ezpl_from_base64_with_serial(
                 )
                 .into());
             };
-            commands.push(format!("{command},{calculated_lot}"));
+            let updated = format!("{command},{calculated_lot}");
+            commands.push(updated.clone());
+            autosave_rows.push(format!("{prefix}||{updated}"));
         } else {
             let mut command = shift_row_coordinates(prefix, command, x_offset, y_offset)?;
             if prefix == "204" {
@@ -500,7 +658,23 @@ fn ezpl_from_base64_with_serial(
                     }
                 }
             }
-            commands.push(command);
+            let saved_command = if prefix == "201" {
+                zero_number_after_marker(&command, "^C")?.unwrap_or_else(|| command.clone())
+            } else {
+                command.clone()
+            };
+            if prefix == "201" && serial_start.is_some() {
+                if let Some(updated) =
+                    replace_number_after_marker(&command, "^C", &serial_start.unwrap().to_string())?
+                {
+                    commands.push(updated);
+                } else {
+                    commands.push(command);
+                }
+            } else {
+                commands.push(command);
+            }
+            autosave_rows.push(format!("{prefix}||{saved_command}"));
         }
     }
 
@@ -518,8 +692,13 @@ fn ezpl_from_base64_with_serial(
     if !commands.is_empty() {
         commands.push('\n');
     }
+    let mut autosave_message = autosave_rows.join("\n");
+    if !autosave_message.is_empty() {
+        autosave_message.push('\n');
+    }
     Ok(ProcessedMessage {
         ezpl: commands,
+        autosave_base64: STANDARD.encode(autosave_message.as_bytes()),
         minima,
     })
 }
@@ -584,18 +763,48 @@ fn main() {
         }
     };
 
-    // Keep `line` unchanged for later EZPL edits; only template lookup is shared.
-    let message_line = message_template_line(line);
-    let message = match latest_message(&config.mysql_url, parsed.project_id, message_line) {
-        Ok(Some(message)) => message,
-        Ok(None) => {
-            eprintln!("No message found for project and line");
-            process::exit(1);
+    let (project_id, message, file_local_name) = if let Some(path) = parsed.input_clf.as_ref() {
+        match load_clf_input(path, parsed.project_id) {
+            Ok(input) => input,
+            Err(error) => {
+                eprintln!("Unable to load CLF input: {error}");
+                process::exit(1);
+            }
         }
-        Err(error) => {
-            eprintln!("Database lookup failed: {error}");
-            process::exit(1);
-        }
+    } else {
+        let project_id = match parsed.project_id {
+            Some(project_id) => project_id,
+            None => {
+                eprintln!("Specify project_ID or use a CLF containing row 008||");
+                process::exit(2);
+            }
+        };
+        // Keep `line` unchanged for later EZPL edits; only template lookup is shared.
+        let message_line = message_template_line(line);
+        let message = match latest_message(&config.mysql_url, project_id, message_line) {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                eprintln!("No message found for project and line");
+                process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("Database lookup failed: {error}");
+                process::exit(1);
+            }
+        };
+        (project_id, message, None)
+    };
+
+    let autosave_printer_id = if file_local_name.is_some() && !parsed.test_mode {
+        Some(match config.printer_id {
+            Some(printer_id) => printer_id,
+            None => {
+                eprintln!("printer_id is required in config.toml to autosave a CLF print");
+                process::exit(2);
+            }
+        })
+    } else {
+        None
     };
 
     if parsed.raw_export {
@@ -606,7 +815,14 @@ fn main() {
                 process::exit(1);
             }
         };
-        let filename = raw_export_filename(parsed.project_id, Local::now().naive_local());
+        let local_name = match raw_message_local_name(&decoded) {
+            Ok(local_name) => local_name,
+            Err(error) => {
+                eprintln!("Unable to read local_name from message: {error}");
+                process::exit(1);
+            }
+        };
+        let filename = raw_export_filename(project_id, &local_name, Local::now().naive_local());
         let path = match std::env::current_dir() {
             Ok(directory) => directory.join(filename),
             Err(error) => {
@@ -630,7 +846,7 @@ fn main() {
     }
 
     let date = parsed.date.unwrap_or_else(|| Local::now().date_naive());
-    let serial_lookup = match find_max_serial_number(&config.mysql_url, parsed.project_id, date) {
+    let serial_lookup = match find_max_serial_number(&config.mysql_url, project_id, date) {
         Ok(result) => result,
         Err(error) => {
             eprintln!("Serial validation failed: {error}");
@@ -639,7 +855,7 @@ fn main() {
     };
     let serial_start = usable_serial_start(serial_lookup.is_serial, serial_lookup.max_serial);
 
-    let calculated_lot = match calculate_project_lot(&config.mysql_url, parsed.project_id, date) {
+    let calculated_lot = match calculate_project_lot(&config.mysql_url, project_id, date) {
         Ok(Some(lot)) => lot,
         Ok(None) => {
             eprintln!("Project has no usable DateCode or LOT result");
@@ -653,7 +869,7 @@ fn main() {
 
     let serial_code = match message_has_prefix(&message, "225") {
         Ok(false) => None,
-        Ok(true) => match generate_serial_code(&config.mysql_url, parsed.project_id, line) {
+        Ok(true) => match generate_serial_code(&config.mysql_url, project_id, line) {
             Ok(serial_code) => Some(serial_code),
             Err(error) => {
                 eprintln!("Serial code generation failed: {error}");
@@ -688,6 +904,22 @@ fn main() {
                         process::exit(1);
                     }
                 }
+
+                if let (Some(name), Some(printer_id)) =
+                    (file_local_name.as_deref(), autosave_printer_id)
+                {
+                    if let Err(error) = save_autosave_message(
+                        &config.mysql_url,
+                        project_id,
+                        name,
+                        line,
+                        printer_id,
+                        &processed.autosave_base64,
+                    ) {
+                        eprintln!("Printed message but failed to save autosave row: {error}");
+                        process::exit(1);
+                    }
+                }
             }
 
             if let Err(error) = append_success_log(&config_path, date, line, &args) {
@@ -709,10 +941,12 @@ mod tests {
     use super::{
         Arguments, PrintOverrides, decode_raw_message, ezpl_from_base64,
         ezpl_from_base64_with_serial, message_has_prefix, message_template_line, parse_args,
-        parse_yymmdd, raw_export_filename, usable_serial_start,
+        parse_yymmdd, raw_export_filename, raw_message_local_name, raw_message_project_id,
+        resolve_project_id, usable_serial_start,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use chrono::NaiveDate;
+    use std::path::PathBuf;
 
     fn parse(values: &[&str]) -> Result<Arguments, String> {
         let args = values
@@ -724,8 +958,55 @@ mod tests {
 
     #[test]
     fn accepts_project_with_optional_line_override() {
-        assert_eq!(parse(&["628"]).unwrap().project_id, 628);
+        assert_eq!(parse(&["628"]).unwrap().project_id, Some(628));
         assert_eq!(parse(&["628", "-l", "3"]).unwrap().line, Some(3));
+    }
+
+    #[test]
+    fn accepts_clf_as_input_with_or_without_project_argument() {
+        let with_project = parse(&["945", "label.clf", "-l", "1"]).unwrap();
+        assert_eq!(with_project.project_id, Some(945));
+        assert_eq!(with_project.input_clf, Some(PathBuf::from("label.clf")));
+
+        let from_file = parse(&["label.clf", "-l", "1"]).unwrap();
+        assert_eq!(from_file.project_id, None);
+        assert_eq!(from_file.input_clf, Some(PathBuf::from("label.clf")));
+    }
+
+    #[test]
+    fn resolves_project_id_from_argument_or_008_row() {
+        let decoded = b"001||01\n008||945\n009||Local Name\n";
+        let embedded = raw_message_project_id(decoded).unwrap();
+        assert_eq!(embedded, Some(945));
+        assert_eq!(resolve_project_id(None, embedded).unwrap(), 945);
+        assert_eq!(resolve_project_id(Some(945), embedded).unwrap(), 945);
+        assert!(resolve_project_id(Some(628), embedded).is_err());
+        assert!(resolve_project_id(None, None).is_err());
+        assert!(raw_message_project_id(b"008||5001\n").is_err());
+    }
+
+    #[test]
+    fn autosave_payload_keeps_print_overrides_and_zeroes_serial_start() {
+        let message = STANDARD
+            .encode("008||945\n009||Demo Label\n207||C0,00000,+1,A1\n201||^C0\n204||^P100\n");
+        let processed = ezpl_from_base64_with_serial(
+            &message,
+            "LOT42",
+            0,
+            0,
+            &PrintOverrides {
+                copies: Some(3),
+                ..PrintOverrides::default()
+            },
+            None,
+            Some(1234),
+        )
+        .unwrap();
+
+        let saved = String::from_utf8(STANDARD.decode(processed.autosave_base64).unwrap()).unwrap();
+        assert!(saved.contains("207||C0,00000,+1,A1"));
+        assert!(saved.contains("201||^C0"));
+        assert!(saved.contains("204||^P3"));
     }
 
     #[test]
@@ -758,9 +1039,16 @@ mod tests {
             .and_hms_opt(9, 8, 7)
             .unwrap();
         assert_eq!(
-            raw_export_filename(945, timestamp),
-            "945_26-10-06_09:08:07.clf"
+            raw_export_filename(945, "Name-With-Spaces", timestamp),
+            "945_Name-With-Spaces_26-10-06_09:08:07.clf"
         );
+    }
+
+    #[test]
+    fn raw_export_uses_sanitized_009_local_name() {
+        let message = b"001||01\n009||GGV 11/12: TEST\n201||^E\n";
+        assert_eq!(raw_message_local_name(message).unwrap(), "GGV-11-12-TEST");
+        assert!(raw_message_local_name(b"001||01\n201||^E\n").is_err());
     }
 
     #[test]

@@ -4,3 +4,4 @@ mysql_url = "mysql://USER:PASSWORD@HOST:3306/"
 # Printer destination for rusend (raw TCP, commonly port 9100).
 # printer_ip = "192.0.2.10"
 # printer_port = 9100
+# printer_id = 2

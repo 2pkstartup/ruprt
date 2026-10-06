@@ -63,6 +63,45 @@ pub fn latest_message(
     )
 }
 
+/// Saves a printed file-based message into the autosave partition for this month.
+pub fn save_autosave_message(
+    mysql_url: &str,
+    project_id: u32,
+    name: &str,
+    line: u32,
+    printer_id: u32,
+    mess_64: &str,
+) -> Result<(), mysql::Error> {
+    let pool = Pool::new(mysql_url)?;
+    let mut connection = pool.get_conn()?;
+    let current_month: Option<(i32, u32)> =
+        connection.query_first("SELECT YEAR(CURRENT_DATE), MONTH(CURRENT_DATE)")?;
+    let (year, month) = current_month.ok_or_else(|| {
+        mysql::Error::IoError(std::io::Error::other("database returned no current month"))
+    })?;
+    let month_index = (year - 2000) * 12 + month as i32;
+    if month_index <= 0 {
+        return Err(mysql::Error::IoError(std::io::Error::other(
+            "database returned an unsupported current month",
+        )));
+    }
+
+    let table = format!("tbl_auto_{month_index:04}");
+    let query = format!(
+        "INSERT INTO `mess`.`{table}` (`date`, `projectID`, `name`, `valid`, `line`, `printer`, `archived`, `desc`, `mess_64`) VALUES (NOW(), :project_id, :name, 0, :line, :printer, 0, 'autosave', :mess_64)"
+    );
+    connection.exec_drop(
+        query,
+        params! {
+            "project_id" => project_id,
+            "name" => name,
+            "line" => line,
+            "printer" => printer_id,
+            "mess_64" => mess_64,
+        },
+    )
+}
+
 /// Generates the printer's QR/DataMatrix payload for one project and line.
 pub fn generate_serial_code(
     mysql_url: &str,
