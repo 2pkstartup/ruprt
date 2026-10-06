@@ -2,8 +2,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Local, NaiveDate};
 use ruprt::{
     config::AppConfig,
-    db::{calculate_project_lot, generate_serial_code, latest_message},
+    db::{calculate_project_lot, find_max_serial_number, generate_serial_code, latest_message},
     print_minimal_help,
+    printer::send_to_printer,
 };
 use std::{
     fs::OpenOptions,
@@ -18,6 +19,7 @@ struct Arguments {
     date: Option<NaiveDate>,
     x_offset: i64,
     y_offset: i64,
+    test_mode: bool,
     print_overrides: PrintOverrides,
 }
 
@@ -51,9 +53,13 @@ fn message_template_line(requested_line: u32) -> u32 {
     }
 }
 
+fn usable_serial_start(is_serial: bool, serial_number: u64) -> Option<u64> {
+    (is_serial && serial_number > 0).then_some(serial_number)
+}
+
 fn parse_args(args: &[String]) -> Result<Arguments, String> {
     if args.is_empty() {
-        return Err("Usage: ruprt <project_ID> [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
+        return Err("Usage: ruprt <project_ID> [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
     }
 
     let project_id = args[0]
@@ -73,8 +79,19 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
     let mut stop_possition = None;
     let mut layout_horizontal = None;
     let mut layout_vertical = None;
+    let mut test_mode = false;
     let mut index = 1;
     while index < args.len() {
+        if args[index] == "-t" && !test_mode {
+            test_mode = true;
+            if args.get(index + 1).is_some_and(|value| value == "test") {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
         let value = args
             .get(index + 1)
             .ok_or_else(|| format!("{} requires a value", args[index]))?;
@@ -130,7 +147,7 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
                 )?);
             }
             _ => {
-                return Err("Usage: ruprt <project_ID> [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
+                return Err("Usage: ruprt <project_ID> [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]".to_owned());
             }
         }
         index += 2;
@@ -142,6 +159,7 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
         date,
         x_offset: x_offset.unwrap_or(0),
         y_offset: y_offset.unwrap_or(0),
+        test_mode,
         print_overrides: PrintOverrides {
             copies,
             temperature,
@@ -308,6 +326,28 @@ fn replace_number_after_marker(
     )))
 }
 
+fn replace_serial_start(command: &str, serial_number: u64) -> Result<String, String> {
+    let (before_field, field) = command
+        .split_once("C0,")
+        .ok_or_else(|| "EZPL 207 row has no C0 serial field".to_owned())?;
+    let field_width = field.bytes().take_while(u8::is_ascii_digit).count();
+    if field_width == 0 {
+        return Err("EZPL 207 C0 field has no numeric placeholder".to_owned());
+    }
+
+    let serial_text = serial_number.to_string();
+    if serial_text.len() > field_width {
+        return Err(format!(
+            "serial number {serial_number} does not fit the {field_width}-digit EZPL 207 field"
+        ));
+    }
+
+    Ok(format!(
+        "{before_field}C0,{serial_number:0field_width$}{}",
+        &field[field_width..]
+    ))
+}
+
 #[cfg(test)]
 fn ezpl_from_base64(
     encoded: &str,
@@ -323,6 +363,7 @@ fn ezpl_from_base64(
         y_offset,
         print_overrides,
         None,
+        None,
     )
 }
 
@@ -333,6 +374,7 @@ fn ezpl_from_base64_with_serial(
     y_offset: i64,
     print_overrides: &PrintOverrides,
     serial_code: Option<&str>,
+    serial_start: Option<u64>,
 ) -> Result<ProcessedMessage, Box<dyn std::error::Error>> {
     let decoded = STANDARD.decode(encoded.trim())?;
     let decoded = String::from_utf8(decoded)?;
@@ -366,6 +408,12 @@ fn ezpl_from_base64_with_serial(
                 )
             })?;
             commands.push(serial_code.to_owned());
+        } else if prefix == "207" {
+            if let Some(serial_start) = serial_start {
+                commands.push(replace_serial_start(command, serial_start)?);
+            } else {
+                commands.push(command.to_owned());
+            }
         } else if prefix == "210" {
             let Some((command, _old_lot)) = command.rsplit_once(',') else {
                 return Err(std::io::Error::new(
@@ -387,6 +435,13 @@ fn ezpl_from_base64_with_serial(
                     }
                 }
             } else if prefix == "201" {
+                if let Some(serial_start) = serial_start {
+                    if let Some(updated) =
+                        replace_number_after_marker(&command, "^C", &serial_start.to_string())?
+                    {
+                        command = updated;
+                    }
+                }
                 if let Some(value) = print_overrides.temperature {
                     if let Some(updated) =
                         replace_number_after_marker(&command, "^H", &value.to_string())?
@@ -483,7 +538,7 @@ fn main() {
             "ruprt",
             env!("CARGO_PKG_VERSION"),
             "Loads and prepares a stored Godex EZPL print message.",
-            "ruprt <project_ID> [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
+            "ruprt <project_ID> [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
             "config.toml: mysql_url = \"mysql://USER:PASSWORD@HOST:3306/\"",
         );
         return;
@@ -513,6 +568,15 @@ fn main() {
     };
 
     let date = parsed.date.unwrap_or_else(|| Local::now().date_naive());
+    let serial_lookup = match find_max_serial_number(&config.mysql_url, parsed.project_id, date) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("Serial validation failed: {error}");
+            process::exit(1);
+        }
+    };
+    let serial_start = usable_serial_start(serial_lookup.is_serial, serial_lookup.max_serial);
+
     let calculated_lot = match calculate_project_lot(&config.mysql_url, parsed.project_id, date) {
         Ok(Some(lot)) => lot,
         Ok(None) => {
@@ -561,14 +625,29 @@ fn main() {
         parsed.y_offset,
         &parsed.print_overrides,
         serial_code.as_deref(),
+        serial_start,
     ) {
         Ok(processed) => {
+            if parsed.test_mode {
+                print!("{}", processed.ezpl);
+            } else {
+                match send_to_printer(&config, processed.ezpl.as_bytes()) {
+                    Ok(address) => {
+                        eprintln!("Sent {} bytes to {address}", processed.ezpl.len());
+                    }
+                    Err(error) => {
+                        eprintln!("Failed to send message to printer: {error}");
+                        process::exit(1);
+                    }
+                }
+            }
+
             if let Err(error) = append_success_log(&config_path, date, line, &args) {
                 eprintln!("Failed to write ruprt.log: {error}");
                 process::exit(1);
             }
+
             let _coordinate_minima = (processed.minima.x, processed.minima.y);
-            print!("{}", processed.ezpl);
         }
         Err(error) => {
             eprintln!("Unable to decode stored message: {error}");
@@ -581,7 +660,7 @@ fn main() {
 mod tests {
     use super::{
         Arguments, PrintOverrides, ezpl_from_base64, ezpl_from_base64_with_serial,
-        message_has_prefix, message_template_line, parse_args, parse_yymmdd,
+        message_has_prefix, message_template_line, parse_args, parse_yymmdd, usable_serial_start,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use chrono::NaiveDate;
@@ -598,6 +677,13 @@ mod tests {
     fn accepts_project_with_optional_line_override() {
         assert_eq!(parse(&["628"]).unwrap().project_id, 628);
         assert_eq!(parse(&["628", "-l", "3"]).unwrap().line, Some(3));
+    }
+
+    #[test]
+    fn accepts_test_mode_with_or_without_the_test_word() {
+        assert!(parse(&["628", "-t"]).unwrap().test_mode);
+        assert!(parse(&["628", "-t", "test"]).unwrap().test_mode);
+        assert!(!parse(&["628"]).unwrap().test_mode);
     }
 
     #[test]
@@ -657,6 +743,13 @@ mod tests {
     }
 
     #[test]
+    fn only_positive_serialized_results_set_serial_start() {
+        assert_eq!(usable_serial_start(false, 123), None);
+        assert_eq!(usable_serial_start(true, 0), None);
+        assert_eq!(usable_serial_start(true, 123), Some(123));
+    }
+
+    #[test]
     fn rejects_invalid_project_and_line_arguments() {
         assert!(parse(&["5001"]).is_err());
         assert!(parse(&["628", "-l"]).is_err());
@@ -675,6 +768,7 @@ mod tests {
                 0,
                 &PrintOverrides::default(),
                 Some("T88792^C0511619962"),
+                None,
             )
             .unwrap()
             .ezpl,
@@ -700,11 +794,40 @@ mod tests {
             0,
             &PrintOverrides::default(),
             Some("T88792C0F126279^C0511619962"),
+            None,
         )
         .unwrap();
         assert_eq!(result.ezpl, "T88792C0F126279^C0511619962\n^E\n");
 
         assert!(ezpl_from_base64(&message, "LOT42", 0, 0, &PrintOverrides::default()).is_err());
+    }
+
+    #[test]
+    fn replaces_serial_start_in_201_c0_and_preserves_it_without_a_start() {
+        let message = STANDARD.encode("201||^C0\n201||^E0\n");
+        let with_serial = ezpl_from_base64_with_serial(
+            &message,
+            "LOT42",
+            0,
+            0,
+            &PrintOverrides::default(),
+            None,
+            Some(12345),
+        )
+        .unwrap();
+        assert_eq!(with_serial.ezpl, "^C12345\n^E0\n");
+
+        let without_serial = ezpl_from_base64_with_serial(
+            &message,
+            "LOT42",
+            0,
+            0,
+            &PrintOverrides::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(without_serial.ezpl, "^C0\n^E0\n");
     }
 
     #[test]

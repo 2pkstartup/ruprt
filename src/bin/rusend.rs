@@ -1,10 +1,8 @@
-use ruprt::{config::AppConfig, print_minimal_help};
+use ruprt::{config::AppConfig, print_minimal_help, printer::send_to_printer};
 use std::{
     error::Error,
-    io::{self, IsTerminal, Read, Write},
-    net::{IpAddr, Shutdown, SocketAddr, TcpStream},
+    io::{self, IsTerminal, Read},
     process,
-    time::Duration,
 };
 
 fn read_message(args: &[String], mut stdin: impl Read) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -29,13 +27,6 @@ fn read_message(args: &[String], mut stdin: impl Read) -> Result<Vec<u8>, Box<dy
     }
 
     Ok(message)
-}
-
-fn send_message(address: SocketAddr, message: &[u8]) -> io::Result<()> {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    stream.write_all(message)?;
-    stream.shutdown(Shutdown::Write)
 }
 
 fn main() {
@@ -66,41 +57,19 @@ fn main() {
             process::exit(1);
         }
     };
-    let ip = match config.printer_ip.as_deref().map(str::parse::<IpAddr>) {
-        Some(Ok(ip)) => ip,
-        Some(Err(error)) => {
-            eprintln!("Invalid printer_ip: {error}");
-            process::exit(2);
+    match send_to_printer(&config, &message) {
+        Ok(address) => eprintln!("Sent {} bytes to {address}", message.len()),
+        Err(error) => {
+            eprintln!("Failed to send message to printer: {error}");
+            process::exit(1);
         }
-        None => {
-            eprintln!("printer_ip is missing from config.toml");
-            process::exit(2);
-        }
-    };
-    let port = match config.printer_port {
-        Some(port) => port,
-        None => {
-            eprintln!("printer_port is missing from config.toml");
-            process::exit(2);
-        }
-    };
-
-    let address = SocketAddr::new(ip, port);
-    if let Err(error) = send_message(address, &message) {
-        eprintln!("Failed to send message to printer: {error}");
-        process::exit(1);
     }
-    eprintln!("Sent {} bytes to {address}", message.len());
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{read_message, send_message};
-    use std::{
-        io::Cursor,
-        net::{Ipv4Addr, TcpListener},
-        thread,
-    };
+    use super::read_message;
+    use std::io::Cursor;
 
     #[test]
     fn reads_message_from_argument_or_stdin_without_changing_bytes() {
@@ -118,20 +87,5 @@ mod tests {
     fn rejects_empty_message_and_multiple_arguments() {
         assert!(read_message(&[], Cursor::new(Vec::new())).is_err());
         assert!(read_message(&["a".to_owned(), "b".to_owned()], Cursor::new(Vec::new())).is_err());
-    }
-
-    #[test]
-    fn sends_all_message_bytes_over_tcp() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let receiver = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut received = Vec::new();
-            std::io::Read::read_to_end(&mut stream, &mut received).unwrap();
-            received
-        });
-
-        send_message(address, b"^Q1\n^E\n").unwrap();
-        assert_eq!(receiver.join().unwrap(), b"^Q1\n^E\n");
     }
 }

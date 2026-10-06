@@ -1,5 +1,6 @@
 pub mod config;
 pub mod db;
+pub mod printer;
 
 /// Prints the standard four-line overview shared by command-line binaries.
 pub fn print_minimal_help(

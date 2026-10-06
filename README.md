@@ -76,7 +76,7 @@ Načte poslední EZPL zprávu pro projekt a linku z `mess.tbl_mess`, dekóduje `
 cargo run --bin ruprt -- 628 -l 4 -d 261001
 ```
 
-Syntaxe je `ruprt <project_ID> [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]`. Linka může být zadána přes `-l`; jinak se použije `default_line` z `config.toml`. Datum `-d` je nepovinné a bez něj se použije dnešní datum. Z `specs.tbl_valves` se načte projektový `DateCode` a procedura `specs.LOT` vypočítá odpovídající lot.
+Syntaxe je `ruprt <project_ID> [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]`. Linka může být zadána přes `-l`; jinak se použije `default_line` z `config.toml`. Datum `-d` je nepovinné a bez něj se použije dnešní datum. Z `specs.tbl_valves` se načte projektový `DateCode` a procedura `specs.LOT` vypočítá odpovídající lot.
 
 Vypočtený lot se dosadí do řádku `210`. Obsahuje-li zpráva řádek `225`, aplikace zavolá `specs.SERNUM` s project ID a původní linkou a celý řádek nahradí vráceným QR/DataMatrix payloadem. Volitelné tiskové parametry mění hodnoty v EZPL; neuvedené parametry ponechají původní hodnotu:
 
@@ -87,6 +87,8 @@ Vypočtený lot se dosadí do řádku `210`. Obsahuje-li zpráva řádek `225`, 
 - `-r value`: horizontální posun layoutu `0–100`, nahrazuje hodnotu za `^R` v příkazu `201`
 - `-q value`: vertikální posun layoutu `-100–100`, nahrazuje hodnotu za `~Q` v příkazu `201`
 - `-x offset`, `-y offset`: podepsaný posun souřadnic v příkazech `231` a `232`; výsledná souřadnice neklesne pod nulu
+
+Po úspěšném zpracování se zpráva standardně odešle na tiskárnu nastavenou v configu. Přepínač `-t` (také `-t test`) zapne testní režim: zprávu pouze vypíše na konzoli a na tiskárnu ji nepošle.
 
 ## `rusend`
 
