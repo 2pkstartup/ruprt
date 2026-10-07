@@ -60,7 +60,26 @@ fn message_template_line(requested_line: u32) -> u32 {
 }
 
 fn usable_serial_start(is_serial: bool, serial_number: u64) -> Option<u64> {
-    (is_serial && serial_number > 0).then_some(serial_number)
+    if !is_serial || serial_number == 0 {
+        return None;
+    }
+
+    serial_number.div_ceil(100).checked_mul(100)
+}
+
+fn format_serial_start(serial_number: u64, digit_count: Option<u32>) -> Result<String, String> {
+    let width = digit_count
+        .filter(|width| *width > 0)
+        .ok_or_else(|| "project has no valid serial digit_count".to_owned())?
+        as usize;
+    let digits = serial_number.to_string();
+    if digits.len() > width {
+        return Err(format!(
+            "serial start {serial_number} does not fit the configured {width}-digit field"
+        ));
+    }
+
+    Ok(format!("{serial_number:0width$}"))
 }
 
 fn parse_args(args: &[String]) -> Result<Arguments, String> {
@@ -282,7 +301,9 @@ fn local_name_component(local_name: &str) -> Option<String> {
     (!component.is_empty()).then_some(component)
 }
 
-fn raw_message_local_name_value(decoded: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+fn raw_message_optional_local_name(
+    decoded: &[u8],
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let decoded = std::str::from_utf8(decoded)?;
     let local_name = decoded
         .lines()
@@ -290,13 +311,15 @@ fn raw_message_local_name_value(decoded: &[u8]) -> Result<String, Box<dyn std::e
             let (prefix, value) = row.split_once("||")?;
             (prefix == "009").then_some(value)
         })
-        .ok_or("raw message is missing its 009 local_name row")?;
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Ok(local_name)
+}
 
-    let local_name = local_name.trim();
-    if local_name.is_empty() {
-        return Err("raw message has an empty local_name".into());
-    }
-    Ok(local_name.to_owned())
+fn raw_message_local_name_value(decoded: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    raw_message_optional_local_name(decoded)?
+        .ok_or_else(|| "raw message has no usable 009 local_name".into())
 }
 
 fn raw_message_local_name(decoded: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
@@ -329,7 +352,7 @@ fn load_clf_input(
     let decoded = fs::read(path)?;
     let project_id = resolve_project_id(argument_project_id, raw_message_project_id(&decoded)?)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let local_name = raw_message_local_name_value(&decoded)?;
+    let local_name = raw_message_optional_local_name(&decoded)?.unwrap_or_else(|| "N/A".to_owned());
     Ok((project_id, STANDARD.encode(decoded), Some(local_name)))
 }
 
@@ -366,22 +389,39 @@ fn message_has_prefix(
     }))
 }
 
-fn coordinates_for_row(prefix: &str, command: &str) -> Option<(i32, i32)> {
-    match prefix {
-        "231" => {
-            let mut fields = command.split(',');
-            fields.next()?;
-            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+fn coordinate_spans(command: &str) -> Vec<(usize, usize)> {
+    let bytes = command.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
         }
-        "232" => {
-            let (command_and_x, remainder) = command.split_once(',')?;
-            let x_start = command_and_x.find(|character: char| character.is_ascii_digit())?;
-            let x = command_and_x[x_start..].parse().ok()?;
-            let y = remainder.split(',').next()?.parse().ok()?;
-            Some((x, y))
+
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
         }
-        _ => None,
+        spans.push((start, index));
     }
+
+    spans
+}
+
+fn coordinates_for_row(prefix: &str, command: &str) -> Option<(i32, i32)> {
+    if prefix != "231" && prefix != "232" {
+        return None;
+    }
+
+    let spans = coordinate_spans(command);
+    let (x_start, x_end) = *spans.first()?;
+    let (y_start, y_end) = *spans.get(1)?;
+    Some((
+        command[x_start..x_end].parse().ok()?,
+        command[y_start..y_end].parse().ok()?,
+    ))
 }
 
 fn update_minima(minima: &mut CoordinateMinima, x: i32, y: i32) {
@@ -407,37 +447,21 @@ fn shift_row_coordinates(
         return Ok(command.to_owned());
     }
 
-    match prefix {
-        "231" => {
-            let mut fields = command.split(',').map(str::to_owned).collect::<Vec<_>>();
-            if fields.len() < 3 {
-                return Err("EZPL 231 row has no X/Y coordinates".to_owned());
-            }
-            fields[1] = shift_coordinate(&fields[1], x_offset)?;
-            fields[2] = shift_coordinate(&fields[2], y_offset)?;
-            Ok(fields.join(","))
-        }
-        "232" => {
-            let (command_and_x, remainder) = command
-                .split_once(',')
-                .ok_or_else(|| "EZPL 232 row has no Y coordinate".to_owned())?;
-            let x_start = command_and_x
-                .find(|character: char| character.is_ascii_digit())
-                .ok_or_else(|| "EZPL 232 row has no X coordinate".to_owned())?;
-            let command_name = &command_and_x[..x_start];
-            let x = shift_coordinate(&command_and_x[x_start..], x_offset)?;
-            let (y_value, remaining_fields) = remainder
-                .split_once(',')
-                .map_or((remainder, None), |(y, rest)| (y, Some(rest)));
-            let y = shift_coordinate(y_value, y_offset)?;
-
-            Ok(match remaining_fields {
-                Some(rest) => format!("{command_name}{x},{y},{rest}"),
-                None => format!("{command_name}{x},{y}"),
-            })
-        }
-        _ => Ok(command.to_owned()),
+    if prefix != "231" && prefix != "232" {
+        return Ok(command.to_owned());
     }
+
+    let spans = coordinate_spans(command);
+    if spans.len() < 2 {
+        return Err(format!("EZPL {prefix} row has no X/Y coordinates"));
+    }
+
+    let mut shifted = command.to_owned();
+    for ((start, end), offset) in spans.into_iter().take(2).zip([x_offset, y_offset]).rev() {
+        let value = shift_coordinate(&command[start..end], offset)?;
+        shifted.replace_range(start..end, &value);
+    }
+    Ok(shifted)
 }
 
 fn replace_number_after_marker(
@@ -469,7 +493,7 @@ fn replace_number_after_marker(
     )))
 }
 
-fn replace_serial_start(command: &str, serial_number: u64) -> Result<String, String> {
+fn replace_serial_start(command: &str, serial_number: &str) -> Result<String, String> {
     let (before_field, field) = command
         .split_once("C0,")
         .ok_or_else(|| "EZPL 207 row has no C0 serial field".to_owned())?;
@@ -478,15 +502,18 @@ fn replace_serial_start(command: &str, serial_number: u64) -> Result<String, Str
         return Err("EZPL 207 C0 field has no numeric placeholder".to_owned());
     }
 
-    let serial_text = serial_number.to_string();
-    if serial_text.len() > field_width {
+    if serial_number.is_empty() || !serial_number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("serial start must contain only digits".to_owned());
+    }
+    if serial_number.len() > field_width {
         return Err(format!(
-            "serial number {serial_number} does not fit the {field_width}-digit EZPL 207 field"
+            "serial start {serial_number} does not fit the {field_width}-digit EZPL 207 field"
         ));
     }
 
+    let padding = "0".repeat(field_width - serial_number.len());
     Ok(format!(
-        "{before_field}C0,{serial_number:0field_width$}{}",
+        "{before_field}C0,{padding}{serial_number}{}",
         &field[field_width..]
     ))
 }
@@ -515,6 +542,20 @@ fn zero_number_after_marker(command: &str, marker: &str) -> Result<Option<String
     ))
 }
 
+fn ensure_autosave_metadata(rows: &mut Vec<String>) {
+    let has_project_id = rows.iter().any(|row| row.starts_with("008||"));
+    let has_local_name = rows.iter().any(|row| row.starts_with("009||"));
+    let mut metadata = Vec::new();
+    if !has_project_id {
+        metadata.push("008||0000".to_owned());
+    }
+    if !has_local_name {
+        metadata.push("009||N/A".to_owned());
+    }
+    metadata.append(rows);
+    *rows = metadata;
+}
+
 #[cfg(test)]
 fn ezpl_from_base64(
     encoded: &str,
@@ -541,7 +582,7 @@ fn ezpl_from_base64_with_serial(
     y_offset: i64,
     print_overrides: &PrintOverrides,
     serial_code: Option<&str>,
-    serial_start: Option<u64>,
+    serial_start: Option<&str>,
 ) -> Result<ProcessedMessage, Box<dyn std::error::Error>> {
     let decoded = STANDARD.decode(encoded.trim())?;
     let decoded = String::from_utf8(decoded)?;
@@ -559,6 +600,9 @@ fn ezpl_from_base64_with_serial(
             autosave_rows.push(row.to_owned());
             continue;
         };
+        if prefix == "200" {
+            continue;
+        }
         if let Some((x, y)) = coordinates_for_row(prefix, command) {
             update_minima(&mut minima, x, y);
         }
@@ -584,7 +628,7 @@ fn ezpl_from_base64_with_serial(
                 Some(serial_start) => replace_serial_start(command, serial_start)?,
                 None => command.to_owned(),
             };
-            let saved_command = replace_serial_start(command, 0)?;
+            let saved_command = replace_serial_start(command, "0")?;
             commands.push(printed_command);
             autosave_rows.push(format!("{prefix}||{saved_command}"));
         } else if prefix == "210" {
@@ -612,7 +656,7 @@ fn ezpl_from_base64_with_serial(
             } else if prefix == "201" {
                 if let Some(serial_start) = serial_start {
                     if let Some(updated) =
-                        replace_number_after_marker(&command, "^C", &serial_start.to_string())?
+                        replace_number_after_marker(&command, "^C", serial_start)?
                     {
                         command = updated;
                     }
@@ -665,7 +709,7 @@ fn ezpl_from_base64_with_serial(
             };
             if prefix == "201" && serial_start.is_some() {
                 if let Some(updated) =
-                    replace_number_after_marker(&command, "^C", &serial_start.unwrap().to_string())?
+                    replace_number_after_marker(&command, "^C", serial_start.unwrap())?
                 {
                     commands.push(updated);
                 } else {
@@ -687,6 +731,8 @@ fn ezpl_from_base64_with_serial(
     {
         return Err("requested print setting was not found in the EZPL message".into());
     }
+
+    ensure_autosave_metadata(&mut autosave_rows);
 
     let mut commands = commands.join("\n");
     if !commands.is_empty() {
@@ -734,7 +780,7 @@ fn main() {
             "ruprt",
             env!("CARGO_PKG_VERSION"),
             "Loads and prepares a stored Godex EZPL print message.",
-            "ruprt <project_ID> [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
+            "ruprt <project_ID|message.clf> [message.clf] [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
             "config.toml: mysql_url = \"mysql://USER:PASSWORD@HOST:3306/\"",
         );
         return;
@@ -853,7 +899,18 @@ fn main() {
             process::exit(1);
         }
     };
-    let serial_start = usable_serial_start(serial_lookup.is_serial, serial_lookup.max_serial);
+    let serial_start_number =
+        usable_serial_start(serial_lookup.is_serial, serial_lookup.max_serial);
+    let serial_start = match serial_start_number {
+        Some(serial_start) => match format_serial_start(serial_start, serial_lookup.digit_count) {
+            Ok(serial_start) => Some(serial_start),
+            Err(error) => {
+                eprintln!("Unable to format serial start: {error}");
+                process::exit(1);
+            }
+        },
+        None => None,
+    };
 
     let calculated_lot = match calculate_project_lot(&config.mysql_url, project_id, date) {
         Ok(Some(lot)) => lot,
@@ -889,7 +946,7 @@ fn main() {
         parsed.y_offset,
         &parsed.print_overrides,
         serial_code.as_deref(),
-        serial_start,
+        serial_start.as_deref(),
     ) {
         Ok(processed) => {
             if parsed.test_mode {
@@ -940,9 +997,10 @@ fn main() {
 mod tests {
     use super::{
         Arguments, PrintOverrides, decode_raw_message, ezpl_from_base64,
-        ezpl_from_base64_with_serial, message_has_prefix, message_template_line, parse_args,
-        parse_yymmdd, raw_export_filename, raw_message_local_name, raw_message_project_id,
-        resolve_project_id, usable_serial_start,
+        ezpl_from_base64_with_serial, format_serial_start, message_has_prefix,
+        message_template_line, parse_args, parse_yymmdd, raw_export_filename,
+        raw_message_local_name, raw_message_local_name_value, raw_message_optional_local_name,
+        raw_message_project_id, resolve_project_id, usable_serial_start,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use chrono::NaiveDate;
@@ -999,14 +1057,25 @@ mod tests {
                 ..PrintOverrides::default()
             },
             None,
-            Some(1234),
+            Some("01234"),
         )
         .unwrap();
 
         let saved = String::from_utf8(STANDARD.decode(processed.autosave_base64).unwrap()).unwrap();
+        assert!(saved.starts_with("008||945\n009||Demo Label\n"));
         assert!(saved.contains("207||C0,00000,+1,A1"));
         assert!(saved.contains("201||^C0"));
         assert!(saved.contains("204||^P3"));
+    }
+
+    #[test]
+    fn inserts_default_008_and_009_rows_when_clf_lacks_them() {
+        let message = STANDARD.encode("201||^E\n");
+        let processed =
+            ezpl_from_base64(&message, "LOT42", 0, 0, &PrintOverrides::default()).unwrap();
+        let saved = String::from_utf8(STANDARD.decode(processed.autosave_base64).unwrap()).unwrap();
+        assert!(saved.starts_with("008||0000\n009||N/A\n"));
+        assert!(processed.ezpl.starts_with("^E\n"));
     }
 
     #[test]
@@ -1049,6 +1118,11 @@ mod tests {
         let message = b"001||01\n009||GGV 11/12: TEST\n201||^E\n";
         assert_eq!(raw_message_local_name(message).unwrap(), "GGV-11-12-TEST");
         assert!(raw_message_local_name(b"001||01\n201||^E\n").is_err());
+        assert_eq!(raw_message_local_name_value(b"009||  ").is_err(), true);
+        assert_eq!(
+            raw_message_optional_local_name(b"008||945\n").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1111,7 +1185,31 @@ mod tests {
     fn only_positive_serialized_results_set_serial_start() {
         assert_eq!(usable_serial_start(false, 123), None);
         assert_eq!(usable_serial_start(true, 0), None);
-        assert_eq!(usable_serial_start(true, 123), Some(123));
+        assert_eq!(usable_serial_start(true, 1), Some(100));
+        assert_eq!(usable_serial_start(true, 784), Some(800));
+        assert_eq!(usable_serial_start(true, 800), Some(800));
+        assert_eq!(usable_serial_start(true, 801), Some(900));
+    }
+
+    #[test]
+    fn preserves_serial_digit_count_after_rounding_to_next_hundred() {
+        let rounded = usable_serial_start(true, 784).unwrap();
+        let formatted = format_serial_start(rounded, Some(5)).unwrap();
+        assert_eq!(formatted, "00800");
+
+        let message = STANDARD.encode("207||C0,00000,+1,A1\n201||^C0\n");
+        let printed = ezpl_from_base64_with_serial(
+            &message,
+            "LOT42",
+            0,
+            0,
+            &PrintOverrides::default(),
+            None,
+            Some(&formatted),
+        )
+        .unwrap();
+        assert!(printed.ezpl.contains("C0,00800,+1,A1"));
+        assert!(printed.ezpl.contains("^C00800"));
     }
 
     #[test]
@@ -1139,6 +1237,19 @@ mod tests {
             .ezpl,
             "^H15\nT88792^C0511619962\n"
         );
+    }
+
+    #[test]
+    fn ignores_200_comment_rows_for_print_and_autosave() {
+        let message = STANDARD.encode("200||debug comment\n201||^E\n");
+        let processed =
+            ezpl_from_base64(&message, "LOT42", 0, 0, &PrintOverrides::default()).unwrap();
+        assert_eq!(processed.ezpl, "^E\n");
+
+        let autosave =
+            String::from_utf8(STANDARD.decode(processed.autosave_base64).unwrap()).unwrap();
+        assert_eq!(autosave, "008||0000\n009||N/A\n201||^E\n");
+        assert!(!autosave.contains("200||"));
     }
 
     #[test]
@@ -1177,7 +1288,7 @@ mod tests {
             0,
             &PrintOverrides::default(),
             None,
-            Some(12345),
+            Some("12345"),
         )
         .unwrap();
         assert_eq!(with_serial.ezpl, "^C12345\n^E0\n");
@@ -1228,6 +1339,26 @@ mod tests {
             processed.ezpl,
             "AD,0000,0255,1,1\nW0250,0055,3,2\nXRB0000,0040,6,2\n"
         );
+    }
+
+    #[test]
+    fn matrix_231_or_232_shift_changes_only_xy_and_preserves_encoding_parameters() {
+        let message = STANDARD.encode("232||XRB0220,0020,5,0,27\n");
+        let processed =
+            ezpl_from_base64(&message, "LOT42", 50, 30, &PrintOverrides::default()).unwrap();
+
+        assert_eq!(processed.ezpl, "XRB0270,0050,5,0,27\n");
+
+        let mislabeled_message = STANDARD.encode("231||XRB0220,0020,5,0,27\n");
+        let mislabeled = ezpl_from_base64(
+            &mislabeled_message,
+            "LOT42",
+            50,
+            30,
+            &PrintOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(mislabeled.ezpl, "XRB0270,0050,5,0,27\n");
     }
 
     #[test]

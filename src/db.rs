@@ -20,6 +20,7 @@ pub struct SerialConfig {
 pub struct SerialLookup {
     pub is_serial: bool,
     pub max_serial: u64,
+    pub digit_count: Option<u32>,
 }
 
 /// Reads a project's serialization settings from the shared `specs` database.
@@ -249,8 +250,14 @@ pub fn find_max_serial_number(
         return Ok(SerialLookup {
             is_serial: false,
             max_serial: 0,
+            digit_count: None,
         });
     }
+
+    let digit_count: Option<Option<u32>> = connection.exec_first(
+        "SELECT c.digit_count FROM specs.tbl_serials s LEFT JOIN specs.tbl_coding c ON s.coding = c.id WHERE s.projectID = :project_id",
+        params! { "project_id" => project_id },
+    )?;
 
     // The procedure uses the same inclusive date bounds for its log search.
     let start_date = date_of_print
@@ -316,6 +323,7 @@ pub fn find_max_serial_number(
     Ok(SerialLookup {
         is_serial: true,
         max_serial,
+        digit_count: digit_count.flatten(),
     })
 }
 

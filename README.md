@@ -79,7 +79,7 @@ cargo run --bin ruprt -- 628 -l 4 -d 261001
 
 Syntaxe je `ruprt <project_ID|message.clf> [message.clf] [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]`. Linka může být zadána přes `-l`; jinak se použije `default_line` z `config.toml`. Datum `-d` je nepovinné a bez něj se použije dnešní datum. Z `specs.tbl_valves` se načte projektový `DateCode` a procedura `specs.LOT` vypočítá odpovídající lot.
 
-Místo DB zprávy lze předat exportovaný `.clf` soubor. Project ID se vezme z argumentu, nebo z řádku `008||`; jsou-li uvedeny obě hodnoty, musí být shodné. Po úspěšném fyzickém tisku se upravená zpráva uloží jako Base64 do aktuální měsíční `mess.tbl_auto_YYYY` (`valid=0`, `desc=autosave`). Jméno se převezme z `009||`, `printer` z `printer_id` v configu. Testní režim `-t` do autosave nic neukládá.
+Místo DB zprávy lze předat exportovaný `.clf` soubor. Project ID se vezme z argumentu, nebo z řádku `008||`; jsou-li uvedeny obě hodnoty, musí být shodné. Po úspěšném fyzickém tisku se upravená zpráva uloží jako Base64 do aktuální měsíční `mess.tbl_auto_YYYY` (`valid=0`, `desc=autosave`). Jméno se převezme z `009||`; pokud chybí, uloží se `N/A`. Chybějící `008||` se při autosave doplní jako `0000`. `printer` se vezme z `printer_id` v configu. Testní režim `-t` do autosave nic neukládá.
 
 Přepínač `--raw` uloží poslední zprávu pro projekt/linku do aktuálního adresáře jako `<projectID>_<YY-MM-DD HH:MM:SS>.clf`. Provede pouze Base64 dekódování `mess_64`; nepočítá lot ani SN a nemění EZPL.
 
