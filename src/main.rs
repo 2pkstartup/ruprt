@@ -1,3 +1,7 @@
+//! Loads EZPL from the database or a `.clf` file, prepares a print copy, and
+//! either prints it in test mode or sends it to the configured printer.
+//! File-based prints also save a zeroed-serial copy into the monthly autosave table.
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Local, NaiveDate, NaiveDateTime};
 use ruprt::{
@@ -17,17 +21,26 @@ use std::{
 };
 
 struct Arguments {
+    /// Optional because a CLF can provide the project in its `008||` row.
     project_id: Option<u32>,
+    /// When present, use this CLF instead of looking up a template in MySQL.
     input_clf: Option<PathBuf>,
+    /// Requested production line; the config supplies a default when omitted.
     line: Option<u32>,
+    /// Date used by project lot and serial lookup; defaults to today's local date.
     date: Option<NaiveDate>,
+    /// Export the stored database message without print processing.
     raw_export: bool,
+    /// Signed shifts applied only to the first two coordinate numbers in 231/232.
     x_offset: i64,
     y_offset: i64,
+    /// Print to stdout instead of sending to the printer; never creates autosave.
     test_mode: bool,
+    /// Explicit changes to print settings; absent values preserve template settings.
     print_overrides: PrintOverrides,
 }
 
+/// Optional EZPL values that are replaced only when their corresponding flag is given.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PrintOverrides {
     copies: Option<u32>,
@@ -38,19 +51,26 @@ struct PrintOverrides {
     layout_vertical: Option<i32>,
 }
 
+/// Original smallest X/Y positions found in the message before applying offsets.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CoordinateMinima {
     x: Option<i32>,
     y: Option<i32>,
 }
 
+/// Both outputs from one transformation: the printed copy and its autosave copy.
+/// The autosave form restores serial-start placeholders to zero.
 #[derive(Debug, PartialEq, Eq)]
 struct ProcessedMessage {
+    /// Prefix-stripped, transformed EZPL bytes represented as UTF-8 text.
     ezpl: String,
+    /// Base64 of the transformed source rows, with serial-start fields zeroed.
     autosave_base64: String,
     minima: CoordinateMinima,
 }
 
+/// Lines 2, 3, and 4 share the line-2 message template; keep the requested line
+/// separately because serial generation and autosave still use the real line.
 fn message_template_line(requested_line: u32) -> u32 {
     if (2..=4).contains(&requested_line) {
         2
@@ -59,6 +79,8 @@ fn message_template_line(requested_line: u32) -> u32 {
     }
 }
 
+/// Returns no serial start for non-serial projects or an empty history.
+/// Otherwise advances to the next hundred so the current print starts a fresh block.
 fn usable_serial_start(is_serial: bool, serial_number: u64) -> Option<u64> {
     if !is_serial || serial_number == 0 {
         return None;
@@ -67,6 +89,7 @@ fn usable_serial_start(is_serial: bool, serial_number: u64) -> Option<u64> {
     serial_number.div_ceil(100).checked_mul(100)
 }
 
+/// Formats a positive start number to the project's configured fixed SN width.
 fn format_serial_start(serial_number: u64, digit_count: Option<u32>) -> Result<String, String> {
     let width = digit_count
         .filter(|width| *width > 0)
@@ -82,6 +105,8 @@ fn format_serial_start(serial_number: u64, digit_count: Option<u32>) -> Result<S
     Ok(format!("{serial_number:0width$}"))
 }
 
+/// Parses a project ID or CLF path followed by non-repeating flag/value pairs.
+/// A project ID in a CLF is reconciled with the optional command-line ID later.
 fn parse_args(args: &[String]) -> Result<Arguments, String> {
     let usage = "Usage: ruprt <project_ID|message.clf> [message.clf] [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]";
     let first = args.first().ok_or_else(|| usage.to_owned())?;
@@ -226,6 +251,7 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
     })
 }
 
+/// Parses an unsigned setting and enforces its inclusive supported range.
 fn parse_bounded_value(value: &str, name: &str, minimum: u32, maximum: u32) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
@@ -238,6 +264,7 @@ fn parse_bounded_value(value: &str, name: &str, minimum: u32, maximum: u32) -> R
     Ok(parsed)
 }
 
+/// Parses a signed setting and enforces its inclusive supported range.
 fn parse_bounded_signed_value(
     value: &str,
     name: &str,
@@ -255,6 +282,7 @@ fn parse_bounded_signed_value(
     Ok(parsed)
 }
 
+/// Interprets two-digit years as 2000-2099 and rejects invalid calendar dates.
 fn parse_yymmdd(value: &str) -> Result<NaiveDate, String> {
     if value.len() != 6 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("date must use YYMMDD format".to_owned());
@@ -266,10 +294,12 @@ fn parse_yymmdd(value: &str) -> Result<NaiveDate, String> {
     NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| "invalid date".to_owned())
 }
 
+/// Decodes the stored message without stripping EZPL source-row prefixes.
 fn decode_raw_message(encoded: &str) -> Result<Vec<u8>, base64::DecodeError> {
     STANDARD.decode(encoded.trim())
 }
 
+/// Converts a local name into one safe filename component without path separators.
 fn local_name_component(local_name: &str) -> Option<String> {
     let mut component = String::new();
     let mut previous_was_separator = false;
@@ -301,6 +331,7 @@ fn local_name_component(local_name: &str) -> Option<String> {
     (!component.is_empty()).then_some(component)
 }
 
+/// Reads the raw `009||` value, if it exists, without applying filename rules.
 fn raw_message_optional_local_name(
     decoded: &[u8],
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -317,16 +348,19 @@ fn raw_message_optional_local_name(
     Ok(local_name)
 }
 
+/// Requires a nonempty `009||` value for database-message export filenames.
 fn raw_message_local_name_value(decoded: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
     raw_message_optional_local_name(decoded)?
         .ok_or_else(|| "raw message has no usable 009 local_name".into())
 }
 
+/// Returns the sanitized local name used by raw export filenames.
 fn raw_message_local_name(decoded: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
     let local_name = raw_message_local_name_value(decoded)?;
     local_name_component(&local_name).ok_or_else(|| "raw message has an empty local_name".into())
 }
 
+/// Reads project ID from the CLF's `008||` row; absence is not itself an error.
 fn raw_message_project_id(decoded: &[u8]) -> Result<Option<u32>, Box<dyn std::error::Error>> {
     let decoded = std::str::from_utf8(decoded)?;
     decoded
@@ -345,6 +379,7 @@ fn raw_message_project_id(decoded: &[u8]) -> Result<Option<u32>, Box<dyn std::er
         .transpose()
 }
 
+/// Loads CLF bytes, resolves project ID, and returns Base64 plus the raw local name.
 fn load_clf_input(
     path: &Path,
     argument_project_id: Option<u32>,
@@ -356,6 +391,7 @@ fn load_clf_input(
     Ok((project_id, STANDARD.encode(decoded), Some(local_name)))
 }
 
+/// Uses the CLI project ID when supplied, but rejects disagreement with row 008.
 fn resolve_project_id(
     argument_project_id: Option<u32>,
     message_project_id: Option<u32>,
@@ -370,6 +406,7 @@ fn resolve_project_id(
     }
 }
 
+/// Builds the non-overwriting filename used by `--raw` exports.
 fn raw_export_filename(project_id: u32, local_name: &str, timestamp: NaiveDateTime) -> String {
     format!(
         "{project_id}_{local_name}_{}.clf",
@@ -377,6 +414,7 @@ fn raw_export_filename(project_id: u32, local_name: &str, timestamp: NaiveDateTi
     )
 }
 
+/// Checks whether a stored message contains a command row with the given prefix.
 fn message_has_prefix(
     encoded: &str,
     target_prefix: &str,
@@ -389,6 +427,7 @@ fn message_has_prefix(
     }))
 }
 
+/// Finds all contiguous ASCII digit ranges; for 231/232 the first two are X/Y.
 fn coordinate_spans(command: &str) -> Vec<(usize, usize)> {
     let bytes = command.as_bytes();
     let mut spans = Vec::new();
@@ -410,6 +449,7 @@ fn coordinate_spans(command: &str) -> Vec<(usize, usize)> {
     spans
 }
 
+/// Reads X/Y from the first two numeric groups in either coordinate-row format.
 fn coordinates_for_row(prefix: &str, command: &str) -> Option<(i32, i32)> {
     if prefix != "231" && prefix != "232" {
         return None;
@@ -424,11 +464,13 @@ fn coordinates_for_row(prefix: &str, command: &str) -> Option<(i32, i32)> {
     ))
 }
 
+/// Updates independent minima from the original coordinates in a message.
 fn update_minima(minima: &mut CoordinateMinima, x: i32, y: i32) {
     minima.x = Some(minima.x.map_or(x, |current| current.min(x)));
     minima.y = Some(minima.y.map_or(y, |current| current.min(y)));
 }
 
+/// Applies one signed offset, clamps at zero, and retains the input digit width.
 fn shift_coordinate(value: &str, offset: i64) -> Result<String, String> {
     let coordinate = value
         .parse::<i64>()
@@ -437,6 +479,7 @@ fn shift_coordinate(value: &str, offset: i64) -> Result<String, String> {
     Ok(format!("{shifted:0width$}", width = value.len()))
 }
 
+/// Shifts only the first two numeric groups of 231/232 and preserves all remaining bytes.
 fn shift_row_coordinates(
     prefix: &str,
     command: &str,
@@ -464,6 +507,7 @@ fn shift_row_coordinates(
     Ok(shifted)
 }
 
+/// Replaces the first integer after an EZPL marker while preserving its suffix.
 fn replace_number_after_marker(
     command: &str,
     marker: &str,
@@ -493,6 +537,7 @@ fn replace_number_after_marker(
     )))
 }
 
+/// Replaces the 207 C0 serial field without changing the rest of that command.
 fn replace_serial_start(command: &str, serial_number: &str) -> Result<String, String> {
     let (before_field, field) = command
         .split_once("C0,")
@@ -518,6 +563,7 @@ fn replace_serial_start(command: &str, serial_number: &str) -> Result<String, St
     ))
 }
 
+/// Zeros the numeric field after a marker while keeping its existing width.
 fn zero_number_after_marker(command: &str, marker: &str) -> Result<Option<String>, String> {
     let Some(marker_start) = command.find(marker) else {
         return Ok(None);
@@ -542,6 +588,7 @@ fn zero_number_after_marker(command: &str, marker: &str) -> Result<Option<String
     ))
 }
 
+/// Ensures every autosave has project/name metadata, using documented fallbacks.
 fn ensure_autosave_metadata(rows: &mut Vec<String>) {
     let has_project_id = rows.iter().any(|row| row.starts_with("008||"));
     let has_local_name = rows.iter().any(|row| row.starts_with("009||"));
@@ -575,6 +622,9 @@ fn ezpl_from_base64(
     )
 }
 
+/// Decodes a template once and builds both its printed EZPL and autosave form.
+/// It strips source prefixes, applies explicit overrides, inserts lot/serial data,
+/// and resets only the autosave serial-start fields to their zero placeholders.
 fn ezpl_from_base64_with_serial(
     encoded: &str,
     calculated_lot: &str,
@@ -749,6 +799,7 @@ fn ezpl_from_base64_with_serial(
     })
 }
 
+/// Appends a successful print's input arguments and effective date/link to the log.
 fn append_success_log(
     config_path: &Path,
     date: NaiveDate,
@@ -773,6 +824,7 @@ fn append_success_log(
     )
 }
 
+/// Orchestrates input selection, always-on serial validation, transform, and output.
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
@@ -809,6 +861,7 @@ fn main() {
         }
     };
 
+    // A CLF is the complete message source; this branch deliberately avoids tbl_mess.
     let (project_id, message, file_local_name) = if let Some(path) = parsed.input_clf.as_ref() {
         match load_clf_input(path, parsed.project_id) {
             Ok(input) => input,
@@ -892,6 +945,7 @@ fn main() {
     }
 
     let date = parsed.date.unwrap_or_else(|| Local::now().date_naive());
+    // Validate serial history even if the template has no serial field.
     let serial_lookup = match find_max_serial_number(&config.mysql_url, project_id, date) {
         Ok(result) => result,
         Err(error) => {
@@ -939,6 +993,7 @@ fn main() {
         }
     };
 
+    // Sending must succeed before a file-based message is committed as autosave.
     match ezpl_from_base64_with_serial(
         &message,
         &calculated_lot,

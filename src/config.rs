@@ -27,6 +27,7 @@ pub struct AppConfig {
 
 impl AppConfig {
     /// Finds `config.toml` above the executable or working directory and loads it.
+    /// This also lets binaries launched from `target/release` find the project config.
     pub fn load() -> Result<Self, Box<dyn Error>> {
         Self::load_with_path().map(|(config, _)| config)
     }
@@ -35,6 +36,7 @@ impl AppConfig {
     pub fn load_with_path() -> Result<(Self, PathBuf), Box<dyn Error>> {
         let mut search_directories = Vec::new();
 
+        // Prefer the executable's ancestors, then fall back to the launch directory.
         if let Ok(executable) = env::current_exe() {
             if let Some(directory) = executable.parent() {
                 search_directories.extend(directory.ancestors().map(Path::to_path_buf));

@@ -1,3 +1,5 @@
+//! Shared configuration, database, and printer facilities for the package binaries.
+
 pub mod config;
 pub mod db;
 pub mod printer;

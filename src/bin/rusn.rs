@@ -6,11 +6,13 @@ use ruprt::{
 use std::process;
 
 #[derive(Debug, PartialEq, Eq)]
+/// Validated command-line inputs for looking up one project's SN.
 struct Arguments {
     project_id: u32,
     lot: String,
 }
 
+/// Pads a positive SN to the project's coding width; 0 remains the no-result sentinel.
 fn format_serial_number(serial_number: u64, digit_count: Option<u32>) -> Result<String, String> {
     if serial_number == 0 {
         return Ok("0".to_owned());
@@ -31,6 +33,7 @@ fn format_serial_number(serial_number: u64, digit_count: Option<u32>) -> Result<
 }
 
 /// Accepts exactly a project ID and its lot code.
+/// Parses exactly the project ID and lot pair accepted by this small CLI.
 fn parse_args(args: &[String]) -> Result<Arguments, String> {
     if args.len() != 2 {
         return Err("Usage: rusn <project_ID> <lot>".to_owned());
@@ -54,6 +57,7 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
     })
 }
 
+/// Checks serialization, resolves the lot date, and prints only the numeric result.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {

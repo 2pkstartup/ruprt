@@ -1,3 +1,8 @@
+//! MySQL accessors shared by the CLI applications.
+//!
+//! Values passed into SQL statements are bound parameters. Dynamic log table
+//! identifiers are derived only from validated project/date numbers.
+
 use chrono::{Datelike, Days, NaiveDate};
 use mysql::{Pool, Row, params, prelude::Queryable};
 use std::{collections::BTreeSet, error::Error};
@@ -75,6 +80,7 @@ pub fn save_autosave_message(
 ) -> Result<(), mysql::Error> {
     let pool = Pool::new(mysql_url)?;
     let mut connection = pool.get_conn()?;
+    // Partition selection uses the DB server's clock, matching its NOW() insert timestamp.
     let current_month: Option<(i32, u32)> =
         connection.query_first("SELECT YEAR(CURRENT_DATE), MONTH(CURRENT_DATE)")?;
     let (year, month) = current_month.ok_or_else(|| {
@@ -111,6 +117,7 @@ pub fn generate_serial_code(
 ) -> Result<String, Box<dyn Error>> {
     let pool = Pool::new(mysql_url)?;
     let mut connection = pool.get_conn()?;
+    // The session variable must be read on this same connection after the procedure call.
     connection.exec_drop(
         "CALL specs.SERNUM(@sn, :project_id, NOW(), :line)",
         params! {
@@ -142,6 +149,7 @@ pub fn calculate_project_lot(
     let Some(code) = date_code.trim().chars().next() else {
         return Ok(None);
     };
+    // LOT returns one column per supported DateCode family in the constant's order.
     let Some(result_column) = LOT_DATE_CODES
         .iter()
         .position(|candidate| *candidate == code)
@@ -274,6 +282,7 @@ pub fn find_max_serial_number(
     let project_table = format!("{project_id:04}");
     let mut lines = BTreeSet::new();
 
+    // The procedure spans at most adjacent months; inspect each corresponding partition.
     for month in start_month..=end_month {
         let table = format!("tbl_{project_table}_{month:04}");
         // Bind values for metadata checks; dynamic identifiers below are built
@@ -306,6 +315,7 @@ pub fn find_max_serial_number(
     // The procedure accepts DATETIME; this CLI currently supplies date-only input.
     let date_argument = date_of_print.format("%Y-%m-%d 00:00:00").to_string();
     let mut max_serial = 0;
+    // Each line may have a different latest serial; select the largest procedure result.
     for line in lines {
         // Each call returns the maximum SN for one line. The winner is the
         // largest result across all lines that had records in the search window.

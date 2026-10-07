@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+/// Sends a raw EZPL byte stream and returns the configured socket endpoint.
+/// Success confirms TCP write/close only; printer-side acceptance is not acknowledged.
 pub fn send_to_printer(config: &AppConfig, message: &[u8]) -> Result<SocketAddr, Box<dyn Error>> {
     let ip = config
         .printer_ip
@@ -32,6 +34,7 @@ fn write_print_log(path: &Path, message: &[u8]) -> io::Result<()> {
     file.write_all(message)
 }
 
+/// Connects first, overwrites the audit payload, then sends exactly those bytes.
 fn send_to_address_with_log(
     address: SocketAddr,
     message: &[u8],

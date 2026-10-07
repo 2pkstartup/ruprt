@@ -5,6 +5,7 @@ use std::{
     process,
 };
 
+/// Reads an exact payload from one argument or stdin; stdin is consumed to EOF.
 fn read_message(args: &[String], mut stdin: impl Read) -> Result<Vec<u8>, Box<dyn Error>> {
     let message = match args {
         [message] => message.as_bytes().to_vec(),
@@ -29,6 +30,7 @@ fn read_message(args: &[String], mut stdin: impl Read) -> Result<Vec<u8>, Box<dy
     Ok(message)
 }
 
+/// Sends the supplied raw bytes to the configured printer without altering them.
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() && io::stdin().is_terminal() {
