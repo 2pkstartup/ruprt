@@ -36,6 +36,8 @@ struct Arguments {
     y_offset: i64,
     /// Print to stdout instead of sending to the printer; never creates autosave.
     test_mode: bool,
+    /// Skip the autosave insert after printing a file.
+    skip_autosave: bool,
     /// Explicit changes to print settings; absent values preserve template settings.
     print_overrides: PrintOverrides,
 }
@@ -108,7 +110,7 @@ fn format_serial_start(serial_number: u64, digit_count: Option<u32>) -> Result<S
 /// Parses a project ID or CLF path followed by non-repeating flag/value pairs.
 /// A project ID in a CLF is reconciled with the optional command-line ID later.
 fn parse_args(args: &[String]) -> Result<Arguments, String> {
-    let usage = "Usage: ruprt <project_ID|message.clf> [message.clf] [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]";
+    let usage = "Usage: ruprt <project_ID|message.clf> [message.clf] [-v] [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]";
     let first = args.first().ok_or_else(|| usage.to_owned())?;
     let project_id = first.parse::<u32>().ok();
     if project_id.is_some_and(|id| id > 5000) {
@@ -139,7 +141,13 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
     let mut layout_vertical = None;
     let mut test_mode = false;
     let mut raw_export = false;
+    let mut skip_autosave = false;
     while index < args.len() {
+        if args[index] == "-v" && !skip_autosave {
+            skip_autosave = true;
+            index += 1;
+            continue;
+        }
         if input_clf.is_none()
             && Path::new(&args[index])
                 .extension()
@@ -230,6 +238,9 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
     if raw_export && input_clf.is_some() {
         return Err("--raw cannot be combined with a .clf input file".to_owned());
     }
+    if skip_autosave && input_clf.is_none() {
+        return Err("-v requires a .clf input file".to_owned());
+    }
 
     Ok(Arguments {
         project_id,
@@ -240,6 +251,7 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
         x_offset: x_offset.unwrap_or(0),
         y_offset: y_offset.unwrap_or(0),
         test_mode,
+        skip_autosave,
         print_overrides: PrintOverrides {
             copies,
             temperature,
@@ -634,6 +646,28 @@ fn ezpl_from_base64_with_serial(
     serial_code: Option<&str>,
     serial_start: Option<&str>,
 ) -> Result<ProcessedMessage, Box<dyn std::error::Error>> {
+    process_message(
+        encoded,
+        calculated_lot,
+        x_offset,
+        y_offset,
+        print_overrides,
+        serial_code,
+        serial_start,
+        false,
+    )
+}
+
+fn process_message(
+    encoded: &str,
+    calculated_lot: &str,
+    x_offset: i64,
+    y_offset: i64,
+    print_overrides: &PrintOverrides,
+    serial_code: Option<&str>,
+    serial_start: Option<&str>,
+    preserve_file_values: bool,
+) -> Result<ProcessedMessage, Box<dyn std::error::Error>> {
     let decoded = STANDARD.decode(encoded.trim())?;
     let decoded = String::from_utf8(decoded)?;
     let mut commands = Vec::new();
@@ -665,12 +699,16 @@ fn ezpl_from_base64_with_serial(
         }
 
         if prefix == "225" {
-            let serial_code = serial_code.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "EZPL 225 row requires a generated serial code",
-                )
-            })?;
+            let serial_code = if preserve_file_values {
+                command
+            } else {
+                serial_code.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "EZPL 225 row requires a generated serial code",
+                    )
+                })?
+            };
             commands.push(serial_code.to_owned());
             autosave_rows.push(format!("{prefix}||{serial_code}"));
         } else if prefix == "207" {
@@ -682,6 +720,11 @@ fn ezpl_from_base64_with_serial(
             commands.push(printed_command);
             autosave_rows.push(format!("{prefix}||{saved_command}"));
         } else if prefix == "210" {
+            if preserve_file_values {
+                commands.push(command.to_owned());
+                autosave_rows.push(row.to_owned());
+                continue;
+            }
             let Some((command, _old_lot)) = command.rsplit_once(',') else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -824,6 +867,70 @@ fn append_success_log(
     )
 }
 
+/// Prints a self-contained CLF without consulting project templates or procedures.
+fn run_clf(
+    parsed: &Arguments,
+    config: &AppConfig,
+    config_path: &Path,
+    args: &[String],
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let decoded = fs::read(path)?;
+    let embedded_id = raw_message_project_id(&decoded)?;
+    let project_id = if parsed.project_id.is_none() && embedded_id.is_none() {
+        0
+    } else {
+        resolve_project_id(parsed.project_id, embedded_id)?
+    };
+    let name = raw_message_optional_local_name(&decoded)?.unwrap_or_else(|| "N/A".to_owned());
+    let line = parsed.line.or(config.default_line).unwrap_or(0);
+    let printer_id = if !parsed.skip_autosave && !parsed.test_mode {
+        Some(
+            config
+                .printer_id
+                .ok_or("printer_id is required for CLF autosave")?,
+        )
+    } else {
+        None
+    };
+    let processed = process_message(
+        &STANDARD.encode(decoded),
+        "",
+        parsed.x_offset,
+        parsed.y_offset,
+        &parsed.print_overrides,
+        None,
+        None,
+        true,
+    )?;
+    if parsed.test_mode {
+        print!("{}", processed.ezpl);
+    } else {
+        let address = send_to_printer(config, processed.ezpl.as_bytes())?;
+        eprintln!("Sent {} bytes to {address}", processed.ezpl.len());
+        if let Some(printer_id) = printer_id {
+            save_autosave_message(
+                &config.mysql_url,
+                project_id,
+                &name,
+                line,
+                printer_id,
+                &processed.autosave_base64,
+            )
+            .map_err(|error| {
+                format!("Message sent, but autosave failed (do not reprint automatically): {error}")
+            })?;
+        }
+    }
+    append_success_log(
+        config_path,
+        parsed.date.unwrap_or_else(|| Local::now().date_naive()),
+        line,
+        args,
+    )?;
+    Ok(())
+}
+
 /// Orchestrates input selection, always-on serial validation, transform, and output.
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -832,7 +939,7 @@ fn main() {
             "ruprt",
             env!("CARGO_PKG_VERSION"),
             "Loads and prepares a stored Godex EZPL print message.",
-            "ruprt <project_ID|message.clf> [message.clf] [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
+            "ruprt <project_ID|message.clf> [message.clf] [-v] [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
             "config.toml: mysql_url = \"mysql://USER:PASSWORD@HOST:3306/\"",
         );
         return;
@@ -853,6 +960,13 @@ fn main() {
             process::exit(1);
         }
     };
+    if let Some(path) = parsed.input_clf.as_ref() {
+        if let Err(error) = run_clf(&parsed, &config, &config_path, &args, path) {
+            eprintln!("CLF print failed: {error}");
+            process::exit(1);
+        }
+        return;
+    }
     let line = match parsed.line.or(config.default_line) {
         Some(line) => line,
         None => {
@@ -1060,6 +1174,41 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use chrono::NaiveDate;
     use std::path::PathBuf;
+
+    #[test]
+    fn accepts_file_only_and_optional_no_autosave_flag() {
+        let parsed = parse(&["label.clf"]).unwrap();
+        assert_eq!(parsed.project_id, None);
+        assert_eq!(parsed.line, None);
+        assert!(!parsed.skip_autosave);
+        assert!(parse(&["label.clf", "-v"]).unwrap().skip_autosave);
+        assert!(parse(&["945", "-v"]).is_err());
+    }
+
+    #[test]
+    fn file_print_preserves_lot_qr_and_serial_without_project_metadata() {
+        let encoded = STANDARD.encode(
+            "200||comment\n210||AT,0010,0020,OLDLOT\n225||QR^C0\n207||C0,00123,+1,A1\n201||E\n",
+        );
+        let result = super::process_message(
+            &encoded,
+            "",
+            0,
+            0,
+            &PrintOverrides::default(),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            result.ezpl,
+            "AT,0010,0020,OLDLOT\nQR^C0\nC0,00123,+1,A1\nE\n"
+        );
+        let saved = String::from_utf8(STANDARD.decode(result.autosave_base64).unwrap()).unwrap();
+        assert!(saved.starts_with("008||0000\n009||N/A\n"));
+        assert!(saved.contains("207||C0,00000,+1,A1"));
+    }
 
     fn parse(values: &[&str]) -> Result<Arguments, String> {
         let args = values

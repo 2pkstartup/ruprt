@@ -81,6 +81,15 @@ Syntaxe je `ruprt <project_ID|message.clf> [message.clf] [--raw] [-t [test]] [-l
 
 Místo DB zprávy lze předat exportovaný `.clf` soubor. Project ID se vezme z argumentu, nebo z řádku `008||`; jsou-li uvedeny obě hodnoty, musí být shodné. Po úspěšném fyzickém tisku se upravená zpráva uloží jako Base64 do aktuální měsíční `mess.tbl_auto_YYYY` (`valid=0`, `desc=autosave`). Jméno se převezme z `009||`; pokud chybí, uloží se `N/A`. Chybějící `008||` se při autosave doplní jako `0000`. `printer` se vezme z `printer_id` v configu. Testní režim `-t` do autosave nic neukládá.
 
+Soubor lze vytisknout i samotným `ruprt label.clf`, bez project ID a linky. Tento režim ponechá lot, QR/DataMatrix a SN ze souboru; nevolá jejich databázové procedury. Odstraní prefixy a komentáře `200||`, případné zadané tiskové přepínače použije. Chybějící projekt a linka mají pro autosave hodnotu `0` (linka jinak použije `default_line`).
+
+```bash
+cargo run --bin ruprt -- label.clf
+cargo run --bin ruprt -- label.clf -v
+```
+
+`-v` vypne autosave; nevyžaduje pak ani `printer_id`. Bez `-v` zůstává zápis do měsíční autosave tabulky po úspěšném TCP odeslání. TCP odeslání samo nepotvrzuje fyzické vytištění štítku.
+
 Přepínač `--raw` uloží poslední zprávu pro projekt/linku do aktuálního adresáře jako `<projectID>_<YY-MM-DD HH:MM:SS>.clf`. Provede pouze Base64 dekódování `mess_64`; nepočítá lot ani SN a nemění EZPL.
 
 Vypočtený lot se dosadí do řádku `210`. Obsahuje-li zpráva řádek `225`, aplikace zavolá `specs.SERNUM` s project ID a původní linkou a celý řádek nahradí vráceným QR/DataMatrix payloadem. Volitelné tiskové parametry mění hodnoty v EZPL; neuvedené parametry ponechají původní hodnotu:
