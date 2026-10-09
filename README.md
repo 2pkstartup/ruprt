@@ -61,6 +61,14 @@ rusn <project_ID> <lot>
 
 Například `rusn 628 XE15`. `project_ID` musí být celé číslo od `0` do `5000`; lot musí být neprázdný řetězec. Při spuštění bez argumentů aplikace vypíše stručnou nápovědu.
 
+Dlouhá nápověda:
+
+```bash
+rusn --help
+```
+
+Lot se přes `specs.LOT_TO_DATE` převede na datum. Šestimístný číselný lot nelze předat jako lot, protože `-d`/lotové rozhraní rozpoznává šest číslic jako `YYMMDD`.
+
 ### Výstup
 
 Úspěšné spuštění vypíše na standardní výstup pouze číslo:
@@ -71,12 +79,25 @@ Například `rusn 628 XE15`. `project_ID` musí být celé číslo od `0` do `50
 
 Chyby konfigurace nebo databázového připojení se vypisují na standardní chybový výstup a aplikace skončí s nenulovým návratovým kódem.
 
+## `rulot`
+
+Převede lot na datum pomocí `specs.LOT_TO_DATE` a vypíše pouze datum ve formátu `YYMMDD`:
+
+```bash
+cargo run --release --bin rulot -- 945 XK03
+cargo run --release --bin rulot -- 945 -d XK03
+```
+
+Project ID musí být celé číslo `0–5000`. Při spuštění bez argumentů se zobrazí nápověda; nenalezený lot nebo databázová chyba se vypíše na `stderr` a aplikace skončí s nenulovým kódem.
+
 ## `ruprt`
 
 Načte poslední EZPL zprávu pro projekt a linku z `mess.tbl_mess`, dekóduje `mess_64` z Base64, vypočítá projektový lot a vypíše příkazy `2XX||` bez jejich databázových prefixů.
 
 ```bash
 cargo run --bin ruprt -- 628 -l 4 -d 261001
+cargo run --bin ruprt -- 945 -l 1 -d XK03 -p 3 -t
+cargo run --bin ruprt -- --help
 ```
 
 Syntaxe je `ruprt <project_ID|message.clf> [message.clf] [--raw] [-t [test]] [-l line] [-d YYMMDD|lot] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]`. Linka může být zadána přes `-l`; jinak se použije `default_line` z `config.toml`. Bez `-d` se použije dnešní datum. Z `specs.tbl_valves` se načte projektový `DateCode` a procedura `specs.LOT` vypočítá odpovídající lot. Argument `-d` přijímá také lot, například `-d XK03`; ten se přes `specs.LOT_TO_DATE` převede na datum. Šestimístná číselná hodnota se vždy chápe jako datum `YYMMDD`; ostatní neprázdné hodnoty jako lot.
@@ -116,6 +137,10 @@ cat label.ezpl | cargo run --bin rusend
 ```
 
 Konfigurace cíle je ve společném `config.toml` pod `printer_ip` a `printer_port`. Bez argumentu při interaktivním spuštění vypíše aplikace nápovědu; z prázdného stdin zprávu neodešle. Úspěšné odeslání nevypisuje do stdout žádný text, aby se tisková zpráva nemíchala s diagnostikou.
+
+```bash
+rusend --help
+```
 
 ## Vývoj
 

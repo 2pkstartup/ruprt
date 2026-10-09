@@ -44,6 +44,7 @@ struct Arguments {
 
 /// `-d` accepts either a calendar date or a project-specific lot code.
 #[derive(Debug, PartialEq, Eq)]
+/// `-d` is either an explicit calendar date or a lot resolved through MySQL.
 enum DateInput {
     Calendar(NaiveDate),
     Lot(String),
@@ -314,6 +315,7 @@ fn parse_yymmdd(value: &str) -> Result<NaiveDate, String> {
 }
 
 /// Six ASCII digits are reserved for YYMMDD; every other nonempty value is a lot.
+/// Six ASCII digits mean YYMMDD; other nonempty strings are treated as lot codes.
 fn parse_date_or_lot(value: &str) -> Result<DateInput, String> {
     if value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit()) {
         return parse_yymmdd(value).map(DateInput::Calendar);
