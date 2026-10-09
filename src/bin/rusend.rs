@@ -15,7 +15,7 @@
 
 // `use` zpřístupní jména, aby šla psát krátce. Složené závorky { } importují víc věcí najednou.
 // `ruprt` je knihovní část tohoto balíčku.
-use ruprt::{config::AppConfig, print_minimal_help, printer::send_to_printer};
+use ruprt::{config::AppConfig, print_long_help, print_minimal_help, printer::send_to_printer};
 use std::{
     // Trait `Error` = společné rozhraní všech chybových typů (používá se v Box<dyn Error>).
     error::Error,
@@ -82,6 +82,29 @@ fn main() {
     // Argumenty programu bez názvu programu (.skip(1)). `collect::<Vec<_>>()` je poskládá
     // do vektoru; `_` znamená "typ prvků si Rust odvodí sám" (tady String).
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+        print_long_help(
+            "rusend",
+            env!("CARGO_PKG_VERSION"),
+            "Sends raw EZPL bytes to the configured printer over TCP.",
+            "rusend <message> | rusend < message-file",
+            &[
+                (
+                    "message",
+                    "One literal message argument; bytes are sent unchanged.",
+                ),
+                ("stdin", "With no message argument, read input until EOF."),
+                ("--help, -h", "Show this help."),
+            ],
+            &[
+                "rusend \"^Q1\\n^E\\n\"",
+                "cat label.ezpl | rusend",
+                "cargo run --bin ruprt -- 945 -l 1 -p 3 | cargo run --bin rusend --",
+            ],
+            "config.toml: printer_ip = \"192.0.2.10\", printer_port = 9100",
+        );
+        return;
+    }
     // Nápověda se ukáže jen když nejsou argumenty A ZÁROVEŇ stdin je interaktivní terminál
     // (tedy uživatel nic neposílá rourou ani přesměrováním). Jinak by program čekal na vstup.
     if args.is_empty() && io::stdin().is_terminal() {

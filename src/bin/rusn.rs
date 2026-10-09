@@ -19,6 +19,7 @@ use ruprt::{
     // funkce, které komunikují s MySQL
     db::{find_max_serial_number, find_serial_config, lot_to_date},
     // vypíše stručnou nápovědu
+    print_long_help,
     print_minimal_help,
 };
 // Modul std::process obsahuje process::exit() pro ukončení programu s návratovým kódem.
@@ -132,6 +133,25 @@ fn main() {
     // proto .skip(1). .collect() je poskládá do kolekce. Typ `Vec<String>` (vektor = rostoucí
     // pole) je uveden u proměnné a říká collect(), co má vytvořit.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+        print_long_help(
+            "rusn",
+            env!("CARGO_PKG_VERSION"),
+            "Resolves a project lot to its date and prints the latest used serial number.",
+            "rusn <project_ID> <lot>",
+            &[
+                ("project_ID", "Project number, integer from 0 to 5000."),
+                ("lot", "Project lot code resolved with specs.LOT_TO_DATE."),
+                ("--help, -h", "Show this help."),
+            ],
+            &[
+                "rusn 945 XK03",
+                "cargo run --release --bin rusn -- 945 XK03",
+            ],
+            "config.toml: mysql_url = \"mysql://USER:PASSWORD@HOST:3306/\"",
+        );
+        return;
+    }
     // Bez argumentů se vypíše nápověda a program skončí.
     if args.is_empty() {
         print_minimal_help(

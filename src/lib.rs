@@ -17,3 +17,24 @@ pub fn print_minimal_help(
     println!("Usage: {syntax}");
     println!("Config: {config_example}");
 }
+
+/// Prints the shared, sectioned Unix-style help used by package applications.
+pub fn print_long_help(
+    name: &str,
+    version: &str,
+    description: &str,
+    usage: &str,
+    options: &[(&str, &str)],
+    examples: &[&str],
+    config: &str,
+) {
+    println!("{name} {version}\n\n{description}\n\nUSAGE\n    {usage}\n\nOPTIONS");
+    for (option, explanation) in options {
+        println!("    {option:<24} {explanation}");
+    }
+    println!("\nEXAMPLES");
+    for example in examples {
+        println!("    {example}");
+    }
+    println!("\nCONFIGURATION\n{config}");
+}

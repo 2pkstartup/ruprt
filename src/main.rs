@@ -8,9 +8,9 @@ use ruprt::{
     config::AppConfig,
     db::{
         calculate_project_lot, find_max_serial_number, generate_serial_code, latest_message,
-        save_autosave_message,
+        lot_to_date, save_autosave_message,
     },
-    print_minimal_help,
+    print_long_help, print_minimal_help,
     printer::send_to_printer,
 };
 use std::{
@@ -28,7 +28,7 @@ struct Arguments {
     /// Requested production line; the config supplies a default when omitted.
     line: Option<u32>,
     /// Date used by project lot and serial lookup; defaults to today's local date.
-    date: Option<NaiveDate>,
+    date: Option<DateInput>,
     /// Export the stored database message without print processing.
     raw_export: bool,
     /// Signed shifts applied only to the first two coordinate numbers in 231/232.
@@ -40,6 +40,13 @@ struct Arguments {
     skip_autosave: bool,
     /// Explicit changes to print settings; absent values preserve template settings.
     print_overrides: PrintOverrides,
+}
+
+/// `-d` accepts either a calendar date or a project-specific lot code.
+#[derive(Debug, PartialEq, Eq)]
+enum DateInput {
+    Calendar(NaiveDate),
+    Lot(String),
 }
 
 /// Optional EZPL values that are replaced only when their corresponding flag is given.
@@ -110,7 +117,7 @@ fn format_serial_start(serial_number: u64, digit_count: Option<u32>) -> Result<S
 /// Parses a project ID or CLF path followed by non-repeating flag/value pairs.
 /// A project ID in a CLF is reconciled with the optional command-line ID later.
 fn parse_args(args: &[String]) -> Result<Arguments, String> {
-    let usage = "Usage: ruprt <project_ID|message.clf> [message.clf] [-v] [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]";
+    let usage = "Usage: ruprt <project_ID|message.clf> [message.clf] [-v] [--raw] [-t [test]] [-l line] [-d YYMMDD|lot] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]";
     let first = args.first().ok_or_else(|| usage.to_owned())?;
     let project_id = first.parse::<u32>().ok();
     if project_id.is_some_and(|id| id > 5000) {
@@ -185,7 +192,7 @@ fn parse_args(args: &[String]) -> Result<Arguments, String> {
                         .map_err(|_| "line must be a positive integer".to_owned())?,
                 );
             }
-            "-d" if date.is_none() => date = Some(parse_yymmdd(value)?),
+            "-d" if date.is_none() => date = Some(parse_date_or_lot(value)?),
             "-x" if x_offset.is_none() => {
                 x_offset = Some(
                     value
@@ -304,6 +311,17 @@ fn parse_yymmdd(value: &str) -> Result<NaiveDate, String> {
     let month = value[2..4].parse::<u32>().map_err(|_| "invalid date")?;
     let day = value[4..6].parse::<u32>().map_err(|_| "invalid date")?;
     NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| "invalid date".to_owned())
+}
+
+/// Six ASCII digits are reserved for YYMMDD; every other nonempty value is a lot.
+fn parse_date_or_lot(value: &str) -> Result<DateInput, String> {
+    if value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return parse_yymmdd(value).map(DateInput::Calendar);
+    }
+    if value.trim().is_empty() {
+        return Err("date/lot must not be empty".to_owned());
+    }
+    Ok(DateInput::Lot(value.to_owned()))
 }
 
 /// Decodes the stored message without stripping EZPL source-row prefixes.
@@ -924,7 +942,10 @@ fn run_clf(
     }
     append_success_log(
         config_path,
-        parsed.date.unwrap_or_else(|| Local::now().date_naive()),
+        match parsed.date.as_ref() {
+            Some(DateInput::Calendar(date)) => *date,
+            Some(DateInput::Lot(_)) | None => Local::now().date_naive(),
+        },
         line,
         args,
     )?;
@@ -934,12 +955,67 @@ fn run_clf(
 /// Orchestrates input selection, always-on serial validation, transform, and output.
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.len() == 1 && args[0] == "--help" {
+        print_long_help(
+            "ruprt",
+            env!("CARGO_PKG_VERSION"),
+            "Loads a stored Godex EZPL message or a CLF file, applies requested changes, then prints or exports it.",
+            "ruprt <project_ID|message.clf> [message.clf] [OPTIONS]",
+            &[
+                (
+                    "-l LINE",
+                    "Production line; defaults to config default_line.",
+                ),
+                (
+                    "-d YYMMDD|LOT",
+                    "Print date or lot; lot is resolved by specs.LOT_TO_DATE. Six digits mean YYMMDD.",
+                ),
+                ("-p COUNT", "Copies, 1-20000; replaces ^P in row 204."),
+                ("-h TEMP", "Temperature, 0-20; replaces ^H in row 201."),
+                ("-s SPEED", "Print speed, 2-6; replaces ^S in row 201."),
+                ("-e VALUE", "Energy, -40..40; replaces ^E in row 201."),
+                (
+                    "-r VALUE",
+                    "Horizontal layout, 0-100; replaces ^R in row 201.",
+                ),
+                (
+                    "-q VALUE",
+                    "Vertical layout, -100..100; replaces ~Q in row 201.",
+                ),
+                (
+                    "-x/-y OFFSET",
+                    "Shift the first two coordinate numbers in rows 231/232; clamp at zero.",
+                ),
+                (
+                    "-t [test]",
+                    "Show processed EZPL on stdout; do not print or autosave.",
+                ),
+                (
+                    "-v",
+                    "For CLF input, print without inserting an autosave row.",
+                ),
+                (
+                    "--raw",
+                    "Export the latest DB message as a decoded CLF without processing.",
+                ),
+                ("--help", "Show this help."),
+            ],
+            &[
+                "ruprt 945 -l 1 -d XK03 -p 3",
+                "ruprt label.clf -l 1",
+                "ruprt 945 label.clf -l 1 -v",
+                "ruprt 945 -l 1 --raw",
+            ],
+            "config.toml: mysql_url, default_line, printer_ip, printer_port, printer_id",
+        );
+        return;
+    }
     if args.is_empty() {
         print_minimal_help(
             "ruprt",
             env!("CARGO_PKG_VERSION"),
             "Loads and prepares a stored Godex EZPL print message.",
-            "ruprt <project_ID|message.clf> [message.clf] [-v] [--raw] [-t [test]] [-l line] [-d YYMMDD] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
+            "ruprt <project_ID|message.clf> [message.clf] [-v] [--raw] [-t [test]] [-l line] [-d YYMMDD|lot] [-p count] [-h temp] [-s speed] [-e value] [-r value] [-q value] [-x offset] [-y offset]",
             "config.toml: mysql_url = \"mysql://USER:PASSWORD@HOST:3306/\"",
         );
         return;
@@ -1058,7 +1134,22 @@ fn main() {
         return;
     }
 
-    let date = parsed.date.unwrap_or_else(|| Local::now().date_naive());
+    // Resolve lot input only after the project ID is known; downstream logic always uses a date.
+    let date = match parsed.date.as_ref() {
+        Some(DateInput::Calendar(date)) => *date,
+        Some(DateInput::Lot(lot)) => match lot_to_date(&config.mysql_url, project_id, lot) {
+            Ok(Some(date)) => date,
+            Ok(None) => {
+                eprintln!("No date mapping for project {project_id} and lot {lot}");
+                process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("Lot-to-date lookup failed: {error}");
+                process::exit(1);
+            }
+        },
+        None => Local::now().date_naive(),
+    };
     // Validate serial history even if the template has no serial field.
     let serial_lookup = match find_max_serial_number(&config.mysql_url, project_id, date) {
         Ok(result) => result,
@@ -1165,9 +1256,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arguments, PrintOverrides, decode_raw_message, ezpl_from_base64,
+        Arguments, DateInput, PrintOverrides, decode_raw_message, ezpl_from_base64,
         ezpl_from_base64_with_serial, format_serial_start, message_has_prefix,
-        message_template_line, parse_args, parse_yymmdd, raw_export_filename,
+        message_template_line, parse_args, parse_date_or_lot, parse_yymmdd, raw_export_filename,
         raw_message_local_name, raw_message_local_name_value, raw_message_optional_local_name,
         raw_message_project_id, resolve_project_id, usable_serial_start,
     };
@@ -1333,9 +1424,24 @@ mod tests {
     fn accepts_optional_date_in_yymmdd_format() {
         assert_eq!(
             parse(&["628", "-d", "261001"]).unwrap().date,
-            Some(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap())
+            Some(DateInput::Calendar(
+                NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()
+            ))
         );
         assert_eq!(parse_yymmdd("261332"), Err("invalid date".to_owned()));
+    }
+
+    #[test]
+    fn accepts_lot_code_as_date_argument() {
+        assert_eq!(
+            parse(&["945", "-d", "XK03"]).unwrap().date,
+            Some(DateInput::Lot("XK03".to_owned()))
+        );
+        assert_eq!(
+            parse_date_or_lot("261003").unwrap(),
+            DateInput::Calendar(NaiveDate::from_ymd_opt(2026, 10, 3).unwrap())
+        );
+        assert!(parse_date_or_lot("  ").is_err());
     }
 
     #[test]
